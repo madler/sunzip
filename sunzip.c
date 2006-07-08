@@ -1,6 +1,6 @@
 /* sunzip.c -- streaming unzip for reading a zip file from stdin
  * Copyright (C) 2006 Mark Adler, all rights reserved
- * Version 0.3  4 July 2006  Mark Adler
+ * Version 0.31  7 July 2006  Mark Adler
  */
 
 /* Version history:
@@ -25,15 +25,23 @@
                      Apply external attributes from central directory
                      Detect and create symbolic links
                      Catch user interrupt and delete temporary junk
+   0.31  7 Jul 2006  Get name from UTF-8 extra field if present
+                     Fix zip64central offset bug
+                     Change null-replacement character to underscore
+                     Fix bad() error message mid-line handling
+                     Fix stored length corruption bug
+                     Verify that stored lengths are equal
+                     Use larger input buffer when int type is large
+                     Don't use calloc() when int type is large
  */
 
 /* Notes:
    - Link sunzip with zlib 1.2.3 or later, infback9.c and inftree9.c compiled
      (found in the zlib source distribution contrib/ directory), and libbzip2.
    - Much of the zip file decoding capability of sunzip has not been tested as
-     of version 0.3, due to the difficulty of generating varied enough or large
-     enough zip files.  The donation of test-case zip files is welcome.  In
-     particular: all compression methods, with and without data descriptors,
+     of version 0.31, due to the difficulty of generating varied enough or
+     large enough zip files.  The donation of test-case zip files is welcome.
+     In particular: all compression methods, with and without data descriptors,
      various data descriptor styles, zip64 headers, and erroneous zip files.
  */
 
@@ -86,7 +94,10 @@
 #  define SET_BINARY_MODE(file)
 #endif
 
-/* defines for the length of a long */
+/* defines for the lengths of the types */
+#if UINT_MAX > 0xffff
+#  define BIGINT
+#endif
 #if ULONG_MAX >= 0xffffffffffffffffUL
 #  define BIGLONG
 #  if ULONG_MAX > 0xffffffffffffffffUL
@@ -106,7 +117,7 @@
    conventions for path name syntax -- currently set up for Unix */
 
 /* Safe file name character to replace nulls with */
-#define SAFESEP '-'
+#define SAFESEP '_'
 
 /* Unix path delimiter */
 #define PATHDELIM '/'
@@ -398,7 +409,12 @@ struct in {
     unsigned long offset_hi;    /* input stream offset overflow */
 };
 
-#define CHUNK 16384     /* input buffer size (must fit in signed int) */
+/* Input buffer size (must fit in signed int) */
+#ifdef BIGINT
+#  define CHUNK 131072
+#else
+#  define CHUNK 16384
+#endif
 
 /* Load input buffer, assumed to be empty, and return bytes loaded and a
    pointer to them.  read() is called until the buffer is full, or until it
@@ -848,7 +864,7 @@ local void zip64central(unsigned char *data, unsigned len,
 
         /* process zip64 block */
         if (id == 0x0001) {     /* zip64 Extended Information extra block */
-            loc = 0;
+            loc = off;
             if (ulen == LOW4)
                 loc += 8;
             if (clen == LOW4)
@@ -864,6 +880,44 @@ local void zip64central(unsigned char *data, unsigned len,
         off += size;
     } while (off < len);
     return;
+}
+
+/* look for a UTF-8 name in the central header */
+local char *utf8name(unsigned char *data, unsigned len,
+                     unsigned long namecrc, char *name)
+{
+    unsigned off;           /* current offset in extra field */
+    unsigned id, size;      /* block information (id reused for flags) */
+
+    /* scan extra blocks to find time information */
+    off = 0;
+    do {
+        /* check that at least four bytes remain */
+        if (off + 4 < 4 || len < off + 4)
+            return name;            /* invalid block */
+
+        /* get extra block id and data size */
+        id = little2(data + off);
+        size = little2(data + off + 2);
+        off += 4;
+        if (off + size < size || len < off + size)
+            return name;            /* invalid block */
+
+        /* process and copy utf-8 name, discard old name */
+        if (id == 0x7075) {         /* utf-8 extra block */
+            if (size > 5 && data[off] == 1 &&
+                little4(data + off + 1) == namecrc) {
+                tostr((char *)(data + off + 5), size - 5);
+                free(name);
+                name = strnew((char *)(data + off + 5));
+            }
+            return name;
+        }
+
+        /* go to the next block */
+        off += size;
+    } while (off < len);
+    return name;
 }
 
 /* ----- BZip2 Decompression Operation ----- */
@@ -972,6 +1026,8 @@ local void summary(unsigned long entries, unsigned long exist,
 local void bad(char *why, unsigned long entry,
                unsigned long here, unsigned long here_hi)
 {
+    putchar(midline ? '\n' : '\r');
+    midline = 0;
     fflush(stdout);
     fprintf(stderr, "sunzip error: %s in entry #%lu at offset 0x", why, entry);
     if (here_hi)
@@ -1027,7 +1083,7 @@ local void sunzip(int file, int quiet, int write, int over)
     unsigned long tmp4;     /* temporary for get4() and skip() macros */
     unsigned long here;     /* offset of this block */
     unsigned long here_hi;  /* high part of offset */
-    unsigned long sig;      /* data descriptor signature */
+    unsigned long tmp;      /* temporary long */
     unsigned long crc;      /* cyclic redundancy check from header */
     unsigned long clen;     /* compressed length from header */
     unsigned long clen_hi;  /* high part of eight-byte compressed length */
@@ -1051,9 +1107,15 @@ local void sunzip(int file, int quiet, int write, int over)
     z_stream strms, *strm = NULL;       /* inflate structure */
     z_stream strms9, *strm9 = NULL;     /* inflate9 structure */
 
-    /* initialize i/o */
+    /* initialize i/o -- note that output buffer must be 64K both for
+       inflateBack9() as well as to load the maximum name or extra
+       fields */
     inbuf = malloc(CHUNK);
-    outbuf = calloc(4, 16384);     /* must be 65536 for inflateBack9() */
+#ifdef BIGINT
+    outbuf = malloc(65536);
+#else
+    outbuf = calloc(4, 16384);
+#endif
     if (inbuf == NULL || outbuf == NULL)
         bye("out of memory");
     left = 0;
@@ -1164,6 +1226,8 @@ local void sunzip(int file, int quiet, int write, int over)
             if (flag & 1)
                 method = UINT_MAX;
             if (method == 0) {          /* stored */
+                if (clen != ulen || clen_hi != ulen_hi)
+                    bye("zip file format error (stored lengths mismatch)");
                 while (clen_hi || clen > left) {
                     put(out, next, left);
                     if (clen < left) {
@@ -1177,6 +1241,8 @@ local void sunzip(int file, int quiet, int write, int over)
                 put(out, next, (unsigned)clen);
                 left -= (unsigned)clen;
                 next += (unsigned)clen;
+                clen = ulen;
+                clen_hi = ulen_hi;
             }
             else if (method == 8) {     /* deflated */
                 if (strm == NULL) {     /* initialize inflater first time */
@@ -1237,8 +1303,9 @@ local void sunzip(int file, int quiet, int write, int over)
                         "skipping unknown compression method",
                         entries, here, here_hi);
                 skip(clen, in);
+                tmp = clen_hi;
                 if (high) {             /* big one! this could take a while */
-                    while (clen_hi--) {
+                    while (tmp--) {
                         skip(0x80000000UL, in);
                         skip(0x80000000UL, in);
                     }
@@ -1279,7 +1346,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     /* look for an Info-ZIP descriptor (original -- in use) */
                     /* (%% NOTE: replace second signature when actual known) */
                     if (crc == 0x08074b50UL || crc == 0x08074b50UL) {
-                        sig = crc;      /* temporary hold for signature */
+                        tmp = crc;      /* temporary hold for signature */
                         crc = clen;
                         clen = ulen;
                         ulen = get4(in);
@@ -1287,7 +1354,7 @@ local void sunzip(int file, int quiet, int write, int over)
                             /* try no signature with eight-byte lengths */
                             clen_hi = clen;
                             clen = crc;
-                            crc = sig;
+                            crc = tmp;
                             ulen_hi = get4(in);
                             high = 1;
                             if (!GOOD()) {
@@ -1347,11 +1414,23 @@ local void sunzip(int file, int quiet, int write, int over)
 
             /* get and process file name */
             field(nlen, in);                /* get file name */
+            tmp = crc32(crc32(0L, Z_NULL, 0), outbuf, nlen);
             from = (char *)outbuf;
             tostr(from, nlen);              /* make name into a string */
             tohere(from, madeby);           /* convert name for this OS */
             from = deroot(from);            /* force relative */
             name = strnew(from);            /* copy name */
+
+            /* process extra field to get 64-bit offset, if there */
+            field(xlen, in);                /* get extra field */
+            zip64central(outbuf, xlen, clen, ulen, &here, &here_hi);
+#ifdef BIGLONG
+            here += here_hi << 32;
+            here_hi = 0;
+#endif
+
+            /* process extra field to get UTF-8 name, if there */
+            name = utf8name(outbuf, xlen, tmp, name);
 
             /* If tempdir and name collide (pretty unlikely), rename tempdir */
             if (write) {
@@ -1388,13 +1467,6 @@ local void sunzip(int file, int quiet, int write, int over)
                 temp = pathcat(tempdir);
             }
 
-            /* process extra field to get 64-bit offset, if there */
-            field(xlen, in);                /* get extra field */
-            zip64central(outbuf, xlen, clen, ulen, &here, &here_hi);
-#ifdef BIGLONG
-            here += here_hi << 32;
-            here_hi = 0;
-#endif
             /* construct (again) temporary name from offset */
             if (write)
                 strcpy(temp, to36(here, here_hi));
@@ -1569,7 +1641,7 @@ int main(int argc, char **argv)
 
     /* give help if input not redirected */
     if (isatty(0)) {
-        puts("sunzip 0.3, streaming unzip by Mark Adler");
+        puts("sunzip 0.31, streaming unzip by Mark Adler");
         puts("usage: ... | sunzip [-t] [-o] [-q[q]] [dir]");
         puts("       sunzip [-q[q]] [dir] < infile.zip");
         puts("");
