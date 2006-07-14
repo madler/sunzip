@@ -1,6 +1,6 @@
 /* sunzip.c -- streaming unzip for reading a zip file from stdin
  * Copyright (C) 2006 Mark Adler, all rights reserved
- * Version 0.31  7 July 2006  Mark Adler
+ * Version 0.32  14 July 2006  Mark Adler
  */
 
 /* Version history:
@@ -33,13 +33,16 @@
                      Verify that stored lengths are equal
                      Use larger input buffer when int type is large
                      Don't use calloc() when int type is large
+   0.32 14 Jul 2006  Consolidate and simplify extra field processing
+                     Use more portable stat() structure definitions
+                     Allow use of mktemp() when mkdtemp() is not available
  */
 
 /* Notes:
    - Link sunzip with zlib 1.2.3 or later, infback9.c and inftree9.c compiled
      (found in the zlib source distribution contrib/ directory), and libbzip2.
    - Much of the zip file decoding capability of sunzip has not been tested as
-     of version 0.31, due to the difficulty of generating varied enough or
+     of version 0.32, due to the difficulty of generating varied enough or
      large enough zip files.  The donation of test-case zip files is welcome.
      In particular: all compression methods, with and without data descriptors,
      various data descriptor styles, zip64 headers, and erroneous zip files.
@@ -64,8 +67,8 @@
 #include <sys/time.h>   /* futimes(), utimes() */
 #include <assert.h>     /* assert() */
 #include <signal.h>     /* signal() */
-#include <unistd.h>     /* read(), close(), isatty(), chdir(), mkdtemp(), */
-                        /* unlink(), rmdir(), symlink() */
+#include <unistd.h>     /* read(), close(), isatty(), chdir(), mkdtemp() or */
+                        /* mktemp(), unlink(), rmdir(), symlink() */
 #include <fcntl.h>      /* open(), write(), O_WRONLY, O_CREAT, O_EXCL */
 #include <sys/types.h>  /* for mkdir(), stat() */
 #include <sys/stat.h>   /* mkdir(), stat() */
@@ -94,7 +97,8 @@
 #  define SET_BINARY_MODE(file)
 #endif
 
-/* defines for the lengths of the types */
+/* defines for the lengths of the integer types -- assure that longs are either
+   four bytes or greater than or equal to eight bytes in length */
 #if UINT_MAX > 0xffff
 #  define BIGINT
 #endif
@@ -107,6 +111,11 @@
 #  if ULONG_MAX != 0xffffffffUL
 #    error Unexpected size of long data type
 #  endif
+#endif
+
+/* systems for which mkdtemp() is not provided */
+#ifdef VMS
+#  define NOMKDTEMP
 #endif
 
 /* %% need to #define EIGHTDOT3 if limited to 8.3 names, e.g. DOS FAT */
@@ -199,6 +208,19 @@ local void tohere(char *name, unsigned madeby)
    path delimiters that are more than one character */
 local char tempdir[27];
 
+/* make a temporary directory (avoid race condition if mkdtemp available) */
+local char *mktempdir(char *template)
+{
+#ifdef NOMKDTEMP
+    template = mktemp(template);
+    if (template != NULL && mkdir(template, 0700))
+        template = NULL;
+    return template;
+#else
+    return mkdtemp(template);
+#endif
+}
+
 /* remove temporary directory and contents */
 local void rmtempdir(void)
 {
@@ -217,14 +239,14 @@ local void rmtempdir(void)
 
     /* scan the directory and remove its contents */
     dir = opendir(tempdir);
-    if (dir == NULL)
-        return;
-    temp = pathcat(tempdir);
-    while ((ent = readdir(dir)) != NULL) {
-        strcpy(temp, ent->d_name);
-        unlink(tempdir);
+    if (dir != NULL) {
+        temp = pathcat(tempdir);
+        while ((ent = readdir(dir)) != NULL) {
+            strcpy(temp, ent->d_name);
+            unlink(tempdir);
+        }
+        closedir(dir);
     }
-    closedir(dir);
 
     /* remove the empty directory */
     temp = pathbrk(tempdir);
@@ -375,12 +397,14 @@ local int put(void *out_desc, unsigned char *buf, unsigned len)
     unsigned try;
     struct out *out = (struct out *)out_desc;
 
-    /* handle special inflateBack9() case */
-    if (sizeof(unsigned) == 2 && len == 0) {
+#ifndef BIGINT
+    /* handle special inflateBack9() case for 64K len */
+    if (len == 0) {
         len = 32768U;
         put(out, buf, len);
         buf += len;
     }
+#endif
 
     /* update crc and output byte count */
     out->crc = crc32(out->crc, buf, len);
@@ -502,7 +526,7 @@ local struct tree *root = NULL;     /* linked list of top-level directories */
 /* add a path to the cache -- if file true, then whatever comes after the last
    delimiter is a file name, so don't make a directory with that name nor use
    the access and modify times; note if the directory already existed or not */
-local int graft(char *path, int file, long acc, long mod)
+local void graft(char *path, int file, long acc, long mod)
 {
     int ret, was = 0;
     char *name, *cut;
@@ -511,7 +535,7 @@ local int graft(char *path, int file, long acc, long mod)
     /* force path to be relative for security */
     path = deroot(path);
     if (*path == 0)             /* if no name, nothing to do */
-        return -1;
+        return;
 
     /* process each name in the provided path */
     name = path;
@@ -566,7 +590,7 @@ local int graft(char *path, int file, long acc, long mod)
         (*branch)->acc = acc;
         (*branch)->mod = mod;
     }
-    return -1;
+    return;
 }
 
 /* apply the saved directory times to the directories */
@@ -577,9 +601,10 @@ local void setdirtimes(struct tree *branch)
     while (branch != NULL) {
         /* update the times for all the subdirectories of this directory */
         if (branch->subs != NULL) {
-            chdir(branch->name);
-            setdirtimes(branch->subs);
-            chdir("..");
+            if (chdir(branch->name) == 0) {
+                setdirtimes(branch->subs);
+                chdir("..");
+            }
         }
 
         /* then update the times for this directory if new and we have times */
@@ -705,7 +730,8 @@ local void skipadd(unsigned long here, unsigned long here_hi)
 #endif
 }
 
-/* binary search for entry in skip list (assumes ordered) */
+/* binary search for entry in skip list (assumes ordered), return true if it's
+   there */
 local int skipfind(unsigned long here, unsigned long here_hi)
 {
     unsigned long left, right, mid, low;
@@ -743,180 +769,128 @@ local int skipfind(unsigned long here, unsigned long here_hi)
     return 0;
 }
 
-/* Largest four-byte unsigned integer value */
-#define LOW4 0xffffffffUL
-
 /* pull two and four-byte little-endian integers from buffer */
 #define little2(ptr) ((ptr)[0] + ((ptr)[1] << 8))
 #define little4(ptr) (little2(ptr) + ((unsigned long)(little2(ptr + 2)) << 16))
 
-/* extract Unix access and modification times from extra field */
-local void xtimes(unsigned char *data, unsigned len, long *acc, long *mod)
+/* find and return a specific extra block in an extra field */
+local int getblock(unsigned id, unsigned char *extra, unsigned xlen,
+                   unsigned char **block, unsigned *len)
 {
-    unsigned off;           /* current offset in extra field */
-    unsigned id, size;      /* block information (id reused for flags) */
+    unsigned thisid, size;
 
-    /* scan extra blocks to find time information */
-    off = 0;
-    do {
-        /* check that at least four bytes remain */
-        if (off + 4 < 4 || len < off + 4)
-            return;                 /* invalid block */
-
+    /* scan extra blocks */
+    while (xlen) {
         /* get extra block id and data size */
-        id = little2(data + off);
-        size = little2(data + off + 2);
-        off += 4;
-        if (off + size < size || len < off + size)
-            return;                 /* invalid block */
+        if (xlen < 4)
+            return 0;               /* invalid block */
+        thisid = little2(extra);
+        size = little2(extra + 2);
+        extra += 4;
+        xlen -= 4;
+        if (xlen < size)
+            return 0;               /* invalid block */
 
-        /* process relevant blocks */
-        switch (id) {
-        case 0x5455:    /* Extended Timestamp extra block */
-            if (size < 1)
-                return;             /* invalid block */
-            id = data[off];         /* flags */
-            if ((id & 1) == 0)
-                break;              /* if no modify time, don't use */
-            if (size < ((id & 2) << 1) + 5)
-                return;             /* invalid block */
-            *mod = tolong(little4(data + off + 1));
-            *acc = id & 2 ?
-                       tolong(little4(data + off + 5)) :
-                       *mod;
-            return;                 /* good enough -- return times */
-        case 0x000d:    /* PKWare Unix extra field */
-        case 0x5855:    /* Info-ZIP Type 1 Unix extra field */
-            if (size < 8)
-                return;             /* invalid block */
-            *acc = tolong(little4(data + off));
-            *mod = tolong(little4(data + off + 4));
-            /* got something, but keep looking for an extended timestamp */
+        /* check for requested id */
+        if (thisid == id) {
+            *block = extra;
+            *len = size;
+            return 1;               /* got it! */
         }
 
         /* go to the next block */
-        off += size;
-    } while (off < len);
+        extra += size;
+        xlen -= size;
+    }
+    return 0;                       /* wasn't there */
+}
+
+/* extract Unix access and modification times from extra field */
+local void xtimes(unsigned char *extra, unsigned xlen, long *acc, long *mod)
+{
+    unsigned len;
+    unsigned char *block;
+
+    /* process Extended Timestamp block */
+    if (getblock(0x5455, extra, xlen, &block, &len) && len &&
+            (*block & 1) == 0 && len >= ((*block & 2) << 1) + 5) {
+        *mod = tolong(little4(block + 1));
+        *acc = *block & 2 ? tolong(little4(block + 5)) : *mod;
+        return;
+    }
+
+    /* process PKWare Unix or Info-ZIP Type 1 Unix block */
+    if ((getblock(0x5855, extra, xlen, &block, &len) ||
+            getblock(0x000d, extra, xlen, &block, &len)) &&
+            len >= 8) {
+        *acc = tolong(little4(block));
+        *mod = tolong(little4(block + 4));
+    }
 }
 
 /* look for a zip64 block in the local header and update lengths, return
    true if got 8-byte lengths */
-local int zip64local(unsigned char *data, unsigned len,
-    unsigned long *clen, unsigned long *clen_hi,
-    unsigned long *ulen, unsigned long *ulen_hi)
+local int zip64local(unsigned char *extra, unsigned xlen,
+                     unsigned long *clen, unsigned long *clen_hi,
+                     unsigned long *ulen, unsigned long *ulen_hi)
 {
-    unsigned off;           /* current offset in extra field */
-    unsigned id, size;      /* block information (id reused for flags) */
+    unsigned len;
+    unsigned char *block;
 
-    /* scan extra blocks to find time information */
-    off = 0;
-    do {
-        /* check that at least four bytes remain */
-        if (off + 4 < 4 || len < off + 4)
-            return 0;               /* invalid block */
-
-        /* get extra block id and data size */
-        id = little2(data + off);
-        size = little2(data + off + 2);
-        off += 4;
-        if (off + size < size || len < off + size)
-            return 0;               /* invalid block */
-
-        /* process zip64 block */
-        if (id == 0x0001) {     /* zip64 Extended Information extra block */
-            if (size < 16)
-                return 0;           /* invalid block */
-            *ulen = little4(data + off);
-            *ulen_hi = little4(data + off + 4);
-            *clen = little4(data + off + 8);
-            *clen_hi = little4(data + off + 12);
-            return 1;       /* got 8-byte lengths */
-        }
-
-        /* go to the next block */
-        off += size;
-    } while (off < len);
+    /* process zip64 Extended Information block */
+    if (getblock(0x0001, extra, xlen, &block, &len) && len >= 16) {
+        *ulen = little4(block);
+        *ulen_hi = little4(block + 4);
+        *clen = little4(block + 8);
+        *clen_hi = little4(block + 12);
+        return 1;           /* got 8-byte lengths */
+    }
     return 0;               /* didn't get 8-byte lengths */
 }
 
+/* 32-bit marker for presence of 64-bit lengths */
+#define LOW4 0xffffffffUL
+
 /* look for a zip64 block in the central header and update offset */
-local void zip64central(unsigned char *data, unsigned len,
-    unsigned long clen, unsigned long ulen,
-    unsigned long *offset, unsigned long *offset_hi)
+local void zip64central(unsigned char *extra, unsigned xlen,
+                        unsigned long clen, unsigned long ulen,
+                        unsigned long *offset, unsigned long *offset_hi)
 {
-    unsigned off;           /* current offset in extra field */
-    unsigned loc;           /* where local offset info is */
-    unsigned id, size;      /* block information (id reused for flags) */
+    unsigned len;
+    unsigned char *block;
 
-    /* scan extra blocks to find time information */
-    off = 0;
-    do {
-        /* check that at least four bytes remain */
-        if (off + 4 < 4 || len < off + 4)
-            return;                 /* invalid block */
-
-        /* get extra block id and data size */
-        id = little2(data + off);
-        size = little2(data + off + 2);
-        off += 4;
-        if (off + size < size || len < off + size)
-            return;                 /* invalid block */
-
-        /* process zip64 block */
-        if (id == 0x0001) {     /* zip64 Extended Information extra block */
-            loc = off;
-            if (ulen == LOW4)
-                loc += 8;
-            if (clen == LOW4)
-                loc += 8;
-            if (size < loc + 8)
-                return;
-            *offset = little4(data + loc);
-            *offset_hi = little4(data + loc + 4);
-            return;
+    /* process zip64 Extended Information block */
+    if (getblock(0x0001, extra, xlen, &block, &len) && len >= 16) {
+        if (ulen == LOW4) {
+            block += 8;
+            len -= 8;
         }
-
-        /* go to the next block */
-        off += size;
-    } while (off < len);
-    return;
+        if (clen == LOW4) {
+            block += 8;
+            len -= 8;
+        }
+        if (len >= 8) {
+            *offset = little4(block);
+            *offset_hi = little4(block + 4);
+        }
+    }
 }
 
 /* look for a UTF-8 name in the central header */
-local char *utf8name(unsigned char *data, unsigned len,
+local char *utf8name(unsigned char *extra, unsigned xlen,
                      unsigned long namecrc, char *name)
 {
-    unsigned off;           /* current offset in extra field */
-    unsigned id, size;      /* block information (id reused for flags) */
+    unsigned len;
+    unsigned char *block;
 
-    /* scan extra blocks to find time information */
-    off = 0;
-    do {
-        /* check that at least four bytes remain */
-        if (off + 4 < 4 || len < off + 4)
-            return name;            /* invalid block */
-
-        /* get extra block id and data size */
-        id = little2(data + off);
-        size = little2(data + off + 2);
-        off += 4;
-        if (off + size < size || len < off + size)
-            return name;            /* invalid block */
-
-        /* process and copy utf-8 name, discard old name */
-        if (id == 0x7075) {         /* utf-8 extra block */
-            if (size > 5 && data[off] == 1 &&
-                little4(data + off + 1) == namecrc) {
-                tostr((char *)(data + off + 5), size - 5);
-                free(name);
-                name = strnew((char *)(data + off + 5));
-            }
-            return name;
-        }
-
-        /* go to the next block */
-        off += size;
-    } while (off < len);
+    /* process and copy utf-8 name, discard old name */
+    if (getblock(0x7075, extra, xlen, &block, &len) && len > 5 &&
+            *block == 1 && little4(block + 1) == namecrc) {
+        free(name);
+        name = (char *)(block + 5);
+        tostr(name, len - 5);
+        name = strnew(name);
+    }
     return name;
 }
 
@@ -964,9 +938,9 @@ local unsigned bunzip2(unsigned char *next, unsigned left,
             switch (ret) {
             case BZ_MEM_ERROR:
                 bye("out of memory");
-                break;
             case BZ_DATA_ERROR:
             case BZ_DATA_ERROR_MAGIC:
+                BZ2_bzDecompressEnd(&strm);
                 *back = NULL;           /* return a compressed data error */
                 return 0;
             case BZ_PARAM_ERROR:
@@ -1015,11 +989,12 @@ local void summary(unsigned long entries, unsigned long exist,
         if (exist)
             printf(", %lu not overwritten", exist);
         putchar('\n');
-        fflush(stdout);
     }
-    if (skipped)
+    if (skipped) {
+        fflush(stdout);
         fprintf(stderr, "sunzip warning: %lu entr%s skipped\n",
                skipped, skipped == 1 ? "y" : "ies");
+    }
 }
 
 /* display information about bad entry before aborting */
@@ -1108,7 +1083,7 @@ local void sunzip(int file, int quiet, int write, int over)
     z_stream strms9, *strm9 = NULL;     /* inflate9 structure */
 
     /* initialize i/o -- note that output buffer must be 64K both for
-       inflateBack9() as well as to load the maximum name or extra
+       inflateBack9() as well as to load the maximum size name or extra
        fields */
     inbuf = malloc(CHUNK);
 #ifdef BIGINT
@@ -1126,10 +1101,10 @@ local void sunzip(int file, int quiet, int write, int over)
     in->offset_hi = 0;
     SET_BINARY_MODE(in->file);      /* for defective operating systems */
 
-    /* set up for writing */
+    /* set up for writing into a temporary directory */
     if (write) {
         strcpy(tempdir, TEMPDIR);
-        if (mkdtemp(tempdir) == NULL)
+        if (mktempdir(tempdir) == NULL)
             bye("write error");
         temp = pathcat(tempdir);
     }
@@ -1232,7 +1207,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     put(out, next, left);
                     if (clen < left) {
                         clen_hi--;
-                        clen = LOW4 - (left - clen - 1);
+                        clen = 0xffffffffUL - (left - clen - 1);
                     }
                     else
                         clen -= left;
@@ -1299,16 +1274,15 @@ local void sunzip(int file, int quiet, int write, int over)
             }
             else {                      /* skip encrpyted or unknown method */
                 if (quiet < 1)
-                    bad(method == UINT_MAX ? "skipping encrypted entry" :
+                    bad(flag & 1 ? "skipping encrypted entry" :
                         "skipping unknown compression method",
                         entries, here, here_hi);
                 skip(clen, in);
                 tmp = clen_hi;
-                if (high) {             /* big one! this could take a while */
-                    while (tmp--) {
-                        skip(0x80000000UL, in);
-                        skip(0x80000000UL, in);
-                    }
+                while (tmp) {
+                    skip(0x80000000UL, in);
+                    skip(0x80000000UL, in);
+                    tmp--;
                 }
                 skipadd(here, here_hi);
             }
@@ -1332,11 +1306,13 @@ local void sunzip(int file, int quiet, int write, int over)
 
             /* get data descriptor if present --
                allow for several possibilities: four-byte or eight-byte
-               lengths, with no signature or with one of two signatures
-               (the second signature is not known yet -- to be defined
-               by PKWare -- for now allow only one) */
+               lengths, with no signature or with one of two signatures (the
+               second signature is not known yet -- to be defined by PKWare --
+               for now allow only one), note that this will not be attempted
+               for skipped entries, since skipped entries cannot have deferred
+               lengths */
             if (flag & 8) {
-                /* look for PKWare descriptor (even though no one uses it) */
+                /* look for PKWare descriptor (even though no one uses it?) */
                 crc = get4(in);         /* uncompressed data check value */
                 clen = get4(in);        /* compressed size */
                 clen_hi = 0;
@@ -1377,7 +1353,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 }
             }
 
-            /* verify entry and display information */
+            /* verify entry and display information (won't do if skipped) */
             if (method == 0 || method == 8 || method == 9 || method == 12) {
                 if (!GOOD()) {
                     bad("compressed data corrupted, check values mismatch",
@@ -1414,7 +1390,7 @@ local void sunzip(int file, int quiet, int write, int over)
 
             /* get and process file name */
             field(nlen, in);                /* get file name */
-            tmp = crc32(crc32(0L, Z_NULL, 0), outbuf, nlen);
+            tmp = crc32(crc32(0L, Z_NULL, 0), outbuf, nlen);    /* name crc */
             from = (char *)outbuf;
             tostr(from, nlen);              /* make name into a string */
             tohere(from, madeby);           /* convert name for this OS */
@@ -1429,18 +1405,20 @@ local void sunzip(int file, int quiet, int write, int over)
             here_hi = 0;
 #endif
 
-            /* process extra field to get UTF-8 name, if there */
+            /* process extra field to get UTF-8 name, if there (use name crc to
+               verify that name wasn't changed independent of extra field) */
             name = utf8name(outbuf, xlen, tmp, name);
 
-            /* If tempdir and name collide (pretty unlikely), rename tempdir */
+            /* If tempdir and name collide (pretty darned unlikely, but not
+               impossible), make a new tempdir and move the contents over */
             if (write) {
-                /* set up names to compare (destructively) */
+                /* set up names to compare (destructively, will fix later) */
                 temp = pathbrk(tempdir);
                 if (temp != NULL)
                     *temp = 0;
                 from = pathbrk(name);
                 if (from != NULL) {
-                    ret = *from;
+                    ret = *from;                /* save delimiter */
                     *from = 0;
                 }
 
@@ -1452,9 +1430,9 @@ local void sunzip(int file, int quiet, int write, int over)
                     if (temp == NULL)
                         bye("out of memory");
                     strcpy(temp, TEMPDIR);
-                    if (mkdtemp(temp) == NULL)
+                    if (mktempdir(temp) == NULL)    /* make new directory */
                         bye("write error");
-                    mvtempdir(temp);
+                    mvtempdir(temp);            /* transfer contents */
                     if (rmdir(tempdir))
                         bye("write error");
                     strcpy(tempdir, temp);
@@ -1463,11 +1441,11 @@ local void sunzip(int file, int quiet, int write, int over)
 
                 /* restore name and reconstruct temporary directory path */
                 if (from != NULL)
-                    *from = ret;
+                    *from = ret;                /* restore delimiter */
                 temp = pathcat(tempdir);
             }
 
-            /* construct (again) temporary name from offset */
+            /* construct (second time) temporary name from offset */
             if (write)
                 strcpy(temp, to36(here, here_hi));
 
@@ -1489,7 +1467,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     puts(" OK");
             }
 
-            /* writing: see if the temporary file is there */
+            /* writing: see if the temporary file is there (it should be) */
             else if (ftype(tempdir) != 1)
                 bye("zip file format error (local/central offsets mismatch)");
 
@@ -1507,8 +1485,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 if (ret)
                     bye("temporary file missing in action!");
                 unlink(tempdir);
-                graft(name, 0, st.st_atimespec.tv_sec,
-                               st.st_mtimespec.tv_sec);
+                graft(name, 0, st.st_atime, st.st_mtime);
                 if (quiet < 1)
                     puts(" OK");
             }
@@ -1542,19 +1519,21 @@ local void sunzip(int file, int quiet, int write, int over)
                 if (quiet < 1)
                     puts(" OK");
             }
+
+            /* all of the above cases wrote a new line if quiet < 1 */
             midline = 0;
 
             /* apply external attributes -- use Unix if we have them */
             if ((extatt >> 16) && BYUNIX())
                 chmod(name, (extatt >> 16) & 07777);
-            else if (!isdir(name))
+            else if (!isdir(name))              /* use MSDOS write attribute */
                 chmod(name, (extatt & 1 ? 0444 : 0644));
 
-            /* done with name */
+            /* done with entry name */
             free(name);
 
-            /* skip comment field */
-            skip(flag, in);             /* skip comment */
+            /* skip comment field -- last thing in central header */
+            skip(flag, in);
             break;
 
         case 0x05054b50UL:      /* digital signature */
@@ -1570,12 +1549,12 @@ local void sunzip(int file, int quiet, int write, int over)
             mode = ZIP64REC;
             ulen = get4(in);
             ulen_hi = get4(in);
-            while (ulen_hi) {
+            skip(ulen, in);
+            while (ulen_hi) {           /* truly odd, but possible */
                 skip(0x80000000UL, in);
                 skip(0x80000000UL, in);
                 ulen_hi--;
             }
-            skip(ulen, in);
             break;
 
         case 0x07064b50UL:      /* zip64 end of central directory locator */
@@ -1589,7 +1568,6 @@ local void sunzip(int file, int quiet, int write, int over)
             if (mode == LOCAL || mode == ZIP64REC || mode == END)
                 bye("zip file format error (end record misplaced)");
             mode = END;
-            summary(entries, exist, write, quiet);
             skip(16, in);               /* counts and offsets */
             flag = get2(in);            /* zip file comment length */
             skip(flag, in);             /* zip file comment */
@@ -1600,7 +1578,8 @@ local void sunzip(int file, int quiet, int write, int over)
         }
     } until (mode == END);              /* until end record reached (or EOF) */
 
-    /* clean up */
+    /* summarize and clean up */
+    summary(entries, exist, write, quiet);
     if (write) {
         rmtempdir();                    /* remove the temporary directory */
         setdirtimes(root);              /* set saved directory times */
@@ -1616,8 +1595,10 @@ local void sunzip(int file, int quiet, int write, int over)
     free(inbuf);
 
     /* check for junk */
-    if (left != 0 || get(in, NULL) != 0)
+    if (left != 0 || get(in, NULL) != 0) {
+        fflush(stdout);
         fputs("sunzip warning: junk after end of zip file\n", stderr);
+    }
 }
 
 /* catch interrupt in order to delete temporary files and directory */
@@ -1641,7 +1622,7 @@ int main(int argc, char **argv)
 
     /* give help if input not redirected */
     if (isatty(0)) {
-        puts("sunzip 0.31, streaming unzip by Mark Adler");
+        puts("sunzip 0.32, streaming unzip by Mark Adler");
         puts("usage: ... | sunzip [-t] [-o] [-q[q]] [dir]");
         puts("       sunzip [-q[q]] [dir] < infile.zip");
         puts("");
@@ -1653,7 +1634,11 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* process arguments */
+    /* process arguments -- prohibit options after the subdirectory name(s)
+       to make sure we know whether we're writing or not and therefore
+       whether or not to really create those directories (%% better would
+       be to scan for all the options first, and also to reject names if
+       -t is specified, since the names won't be used anyway) */
     opts = 1;                   /* in options */
     sub = 0;                    /* no subdirectory yet */
     while (argv++, --argc) {
