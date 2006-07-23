@@ -1,6 +1,6 @@
 /* sunzip.c -- streaming unzip for reading a zip file from stdin
  * Copyright (C) 2006 Mark Adler, all rights reserved
- * Version 0.32  14 July 2006  Mark Adler
+ * Version 0.33  23 July 2006  Mark Adler
  */
 
 /* Version history:
@@ -36,16 +36,17 @@
    0.32 14 Jul 2006  Consolidate and simplify extra field processing
                      Use more portable stat() structure definitions
                      Allow use of mktemp() when mkdtemp() is not available
+   0.33 23 Jul 2006  Replace futimes() with utimes() for portability
+                     Fix bug in bzip2 decoding
+                     Do two passes on command options to allow any order
+                     Change pathbrk() return value to simplify usage
+                     Protect against parent references ("..") in file names
+                     Move name processing to after possibly getting UTF-8 name
  */
 
 /* Notes:
    - Link sunzip with zlib 1.2.3 or later, infback9.c and inftree9.c compiled
      (found in the zlib source distribution contrib/ directory), and libbzip2.
-   - Much of the zip file decoding capability of sunzip has not been tested as
-     of version 0.32, due to the difficulty of generating varied enough or
-     large enough zip files.  The donation of test-case zip files is welcome.
-     In particular: all compression methods, with and without data descriptors,
-     various data descriptor styles, zip64 headers, and erroneous zip files.
  */
 
 /* To-do:
@@ -60,11 +61,11 @@
 #include <stdio.h>      /* printf(), fprintf(), fflush(), rename(), puts(), */
                         /* fopen(), fread(), fclose() */
 #include <stdlib.h>     /* exit(), malloc(), calloc(), free() */
-#include <string.h>     /* memcpy(), strcpy(), strlen(), strchr(), strcmp() */
+#include <string.h>     /* memcpy(), strcpy(), strlen(), strcmp() */
 #include <ctype.h>      /* tolower() */
 #include <limits.h>     /* LONG_MIN */
 #include <time.h>       /* mktime() */
-#include <sys/time.h>   /* futimes(), utimes() */
+#include <sys/time.h>   /* utimes() */
 #include <assert.h>     /* assert() */
 #include <signal.h>     /* signal() */
 #include <unistd.h>     /* read(), close(), isatty(), chdir(), mkdtemp() or */
@@ -131,6 +132,10 @@
 /* Unix path delimiter */
 #define PATHDELIM '/'
 
+/* Unix parent reference and replacement (must be same length) */
+#define PARENT ".."
+#define PARSAFE "__"
+
 /* convert a block into a string -- replace any zeros and terminate with a
    zero; this assumes that blk is at least len+1 long */
 local void tostr(char *blk, unsigned len)
@@ -168,10 +173,13 @@ local char *pathcat(char *path)
 }
 
 /* given a path, find the next path delimiter and return a pointer to the start
-   of it, or return NULL if the name has no path delimiter after it */
+   of it, or return a pointer to the end of the string if the name has no path
+   delimiter after it */
 local char *pathbrk(char *path)
 {
-    return strchr(path, PATHDELIM);
+    while (*path && *path != PATHDELIM)
+        path++;
+    return path;
 }
 
 /* given a path, skip over path delimiters, if any, to get to the start of the
@@ -183,17 +191,62 @@ local char *pathtok(char *path)
     return path;
 }
 
-/* force path to be relative for security (remove devices, root reference) */
-local char *deroot(char *path)
+/* secure the path name by removing root or device references, and any parent
+   directory references */
+local char *guard(char *path)
 {
-    return pathtok(path);       /* for Unix, skip leading path delimiters */
+    int was;
+    char *left, *prev, *name, *cut;
+
+    /* skip leading path delimiters */
+    path = pathtok(path);
+
+    /* remove parent references */
+    left = path;
+    while (*left) {
+        /* if have a leading parent reference, replace it with safe separators
+           and then prevent deletion of that by moving past it */
+        cut = pathbrk(left);
+        was = *cut;
+        *cut = 0;
+        if (strcmp(left, PARENT) == 0) {
+            strcpy(left, PARSAFE);
+            *cut = was;
+            left = pathtok(cut);
+            continue;
+        }
+        *cut = was;
+
+        /* find non-leading parent reference, if any */
+        prev = left;
+        while (*(name = pathtok(cut))) {
+            cut = pathbrk(name);
+            was = *cut;
+            *cut = 0;
+            if (strcmp(name, PARENT) == 0) {
+                *cut = was;
+                break;
+            }
+            *cut = was;
+            prev = name;
+        }
+        if (*name == 0)
+            break;              /* no more parent references, all done */
+
+        /* delete parent and parent reference and start over */
+        strcpy(prev, pathtok(cut));
+    }
+
+    /* return secured path */
+    return path;
 }
 
 /* convert name from source to current operating system, using the information
-   in the madeby value from the central directory -- name updated in place */
-local void tohere(char *name, unsigned madeby)
+   in the madeby value from the central directory -- name updated in place or
+   name is freed and a new malloc'ed space returned */
+local char *tohere(char *name, unsigned madeby)
 {
-    return;
+    return name;
 }
 
 /* ----- Utility Operations ----- */
@@ -234,8 +287,7 @@ local void rmtempdir(void)
 
     /* get just the directory name */
     temp = pathbrk(tempdir);
-    if (temp != NULL)
-        *temp = 0;
+    *temp = 0;
 
     /* scan the directory and remove its contents */
     dir = opendir(tempdir);
@@ -250,8 +302,7 @@ local void rmtempdir(void)
 
     /* remove the empty directory */
     temp = pathbrk(tempdir);
-    if (temp != NULL)
-        *temp = 0;
+    *temp = 0;
     rmdir(tempdir);
 
     /* mark it as gone */
@@ -267,8 +318,7 @@ local void mvtempdir(char *newtemp)
 
     /* get just the temporary directory name */
     temp = pathbrk(tempdir);
-    if (temp != NULL)
-        *temp = 0;
+    *temp = 0;
 
     /* scan it and move the contents to newtemp */
     dir = opendir(tempdir);
@@ -285,11 +335,9 @@ local void mvtempdir(char *newtemp)
 
     /* remove path delimiters from names */
     temp = pathbrk(tempdir);
-    if (temp != NULL)
-        *temp = 0;
+    *temp = 0;
     dest = pathbrk(newtemp);
-    if (dest != NULL)   
-        *dest = 0;
+    *dest = 0;
 }
 
 /* true if in the middle of a line */
@@ -532,8 +580,8 @@ local void graft(char *path, int file, long acc, long mod)
     char *name, *cut;
     struct tree **branch;
 
-    /* force path to be relative for security */
-    path = deroot(path);
+    /* make the path safe before creating it */
+    path = guard(path);
     if (*path == 0)             /* if no name, nothing to do */
         return;
 
@@ -543,11 +591,9 @@ local void graft(char *path, int file, long acc, long mod)
     for (;;) {
         /* cut out next name in path */
         cut = pathbrk(name);
-        if (cut != NULL) {
-            was = *cut;
-            *cut = 0;
-        }
-        else if (file)
+        was = *cut;
+        *cut = 0;
+        if (was == 0 && file)
             break;              /* don't do last name for a file */
 
         /* search for that name in the list */
@@ -574,10 +620,10 @@ local void graft(char *path, int file, long acc, long mod)
         }
 
         /* see if there's more path -- if not, then done */
-        if (cut == NULL)
+        if (was == 0)
             break;
         *cut = was;                 /* restore delimiter */
-        name = pathtok(cut + 1);    /* next name, skipping extra delimiters */
+        name = pathtok(cut);        /* next name, skipping delimiters */
         if (*name == 0)             /* ended with a delimiter */
             break;
 
@@ -647,9 +693,8 @@ local void mkpath(char *path)
     char *dir, *next;
 
     /* scan path */
-    dir = deroot(path);                 /* go to first name */
-    while ((next = pathbrk(dir)) != NULL) {
-        was = *next;
+    dir = pathtok(path);                /* go to first name */
+    while ((was = *(next = pathbrk(dir))) != 0) {
         *next = 0;
         if (mkdir(path, 0777) && errno != EEXIST)
             bye("write error");
@@ -918,7 +963,7 @@ local unsigned bunzip2(unsigned char *next, unsigned left,
     /* decompress */
     strm.avail_in = left;
     strm.next_in = (char *)next;
-    {
+    do {
         /* get more input if needed */
         if (strm.avail_in == 0) {
             strm.avail_in = get(in, NULL);
@@ -1292,16 +1337,15 @@ local void sunzip(int file, int quiet, int write, int over)
                 in->count_hi--;
             in->count -= left;
 
-            /* set file times, close file */
+            /* close file, set file times */
             if (out->file != -1) {
-                /* set times just before closing */
+                if (close(out->file))
+                    bye("write error");
                 times[0].tv_sec = acc;
                 times[0].tv_usec = 0;
                 times[1].tv_sec = mod;
                 times[1].tv_usec = 0;
-                futimes(out->file, times);
-                if (close(out->file))
-                    bye("write error");
+                utimes(tempdir, times);
             }
 
             /* get data descriptor if present --
@@ -1388,14 +1432,12 @@ local void sunzip(int file, int quiet, int write, int over)
             here = get4(in);            /* offset of local header */
             here_hi = 0;
 
-            /* get and process file name */
+            /* get and save file name, compute name crc */
             field(nlen, in);                /* get file name */
             tmp = crc32(crc32(0L, Z_NULL, 0), outbuf, nlen);    /* name crc */
             from = (char *)outbuf;
             tostr(from, nlen);              /* make name into a string */
-            tohere(from, madeby);           /* convert name for this OS */
-            from = deroot(from);            /* force relative */
-            name = strnew(from);            /* copy name */
+            name = strnew(from);            /* copy from outbuf */
 
             /* process extra field to get 64-bit offset, if there */
             field(xlen, in);                /* get extra field */
@@ -1409,18 +1451,19 @@ local void sunzip(int file, int quiet, int write, int over)
                verify that name wasn't changed independent of extra field) */
             name = utf8name(outbuf, xlen, tmp, name);
 
+            /* process file name */
+            name = tohere(name, madeby);    /* convert name for this OS */
+            name = guard(name);             /* keep the name safe */
+
             /* If tempdir and name collide (pretty darned unlikely, but not
                impossible), make a new tempdir and move the contents over */
             if (write) {
                 /* set up names to compare (destructively, will fix later) */
                 temp = pathbrk(tempdir);
-                if (temp != NULL)
-                    *temp = 0;
+                *temp = 0;
                 from = pathbrk(name);
-                if (from != NULL) {
-                    ret = *from;                /* save delimiter */
-                    *from = 0;
-                }
+                ret = *from;                    /* save delimiter */
+                *from = 0;
 
                 /* if collision (!!) then make a new temporary directory, move
                    the contents over, remove the old one, and update the name
@@ -1440,8 +1483,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 }
 
                 /* restore name and reconstruct temporary directory path */
-                if (from != NULL)
-                    *from = ret;                /* restore delimiter */
+                *from = ret;                    /* restore delimiter */
                 temp = pathcat(tempdir);
             }
 
@@ -1455,8 +1497,17 @@ local void sunzip(int file, int quiet, int write, int over)
                 midline = 1;
             }
 
+            /* if we don't have a name due to parent reference cancellation,
+               then just delete the temporary and skip it (it was a null
+               directory, e.g. "xx/../") */
+            if (*name == 0) {
+                unlink(tempdir);
+                if (quiet < 1)
+                    puts("(null directory skipped)");
+            }
+
             /* see if this entry was skipped */
-            if (skipfind(here, here_hi)) {
+            else if (skipfind(here, here_hi)) {
                 if (quiet < 1)
                     puts(" (skipped)");
             }
@@ -1524,10 +1575,12 @@ local void sunzip(int file, int quiet, int write, int over)
             midline = 0;
 
             /* apply external attributes -- use Unix if we have them */
-            if ((extatt >> 16) && BYUNIX())
-                chmod(name, (extatt >> 16) & 07777);
-            else if (!isdir(name))              /* use MSDOS write attribute */
-                chmod(name, (extatt & 1 ? 0444 : 0644));
+            if (*name) {
+                if ((extatt >> 16) && BYUNIX())
+                    chmod(name, (extatt >> 16) & 07777);
+                else if (!isdir(name))          /* use MSDOS write attribute */
+                    chmod(name, (extatt & 1 ? 0444 : 0644));
+            }
 
             /* done with entry name */
             free(name);
@@ -1610,7 +1663,7 @@ local void cutshort(int n)
 /* process arguments and then unzip from stdin */
 int main(int argc, char **argv)
 {
-    int opts, sub;
+    int n;
     int quiet = 0, write = 1, over = 0;
     char *arg;
 
@@ -1622,7 +1675,7 @@ int main(int argc, char **argv)
 
     /* give help if input not redirected */
     if (isatty(0)) {
-        puts("sunzip 0.32, streaming unzip by Mark Adler");
+        puts("sunzip 0.33, streaming unzip by Mark Adler");
         puts("usage: ... | sunzip [-t] [-o] [-q[q]] [dir]");
         puts("       sunzip [-q[q]] [dir] < infile.zip");
         puts("");
@@ -1634,27 +1687,17 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* process arguments -- prohibit options after the subdirectory name(s)
-       to make sure we know whether we're writing or not and therefore
-       whether or not to really create those directories (%% better would
-       be to scan for all the options first, and also to reject names if
-       -t is specified, since the names won't be used anyway) */
-    opts = 1;                   /* in options */
-    sub = 0;                    /* no subdirectory yet */
-    while (argv++, --argc) {
-        if (opts && **argv == '-') {
-            if (sub)
-                bye("cannot put options after subdirectory");
-            arg = *argv + 1;
-            if (*arg == 0)
-                opts = 0;
-            else do {
+    /* scan options in arguments */
+    for (n = 1; n < argc; n++)
+        if (argv[n][0] == '-') {
+            arg = argv[n] + 1;
+            while (*arg) {
                 switch (*arg) {
                 case 'o':           /* overwrite existing files */
                     over = 1;
                     break;
                 case 'q':           /* quiet */
-                    quiet++;
+                    quiet++;        /* qq is even more quiet */
                     break;
                 case 't':           /* test */
                     write = 0;
@@ -1662,21 +1705,25 @@ int main(int argc, char **argv)
                 default:
                     bye("unknown option");
                 }
-            } while (*++arg);
-        }
-        else {                      /* subdirectory to put files in */
-            sub = 1;                /* don't process options after this */
-            if (write) {            /* ignore subdirectory if not writing */
-                mkpath(*argv);
-                if (chdir(*argv))
-                    bye("write error");
+                arg++;
             }
         }
-    }
 
     /* check option consistency */
     if (over && !write)
         bye("can't combine -o with -t");
+
+    /* scan non-options, which is where to create and put entries in -- the
+       directory is created and then we cd in there, multiple name arguments
+       simply create deeper subdirectories for the destination */
+    for (n = 1; n < argc; n++)
+        if (argv[n][0] != '-') {
+            if (!write)
+                bye("cannot specify destination directory with -t");
+            mkpath(argv[n]);
+            if (chdir(argv[n]))
+                bye("write error");
+        }
 
     /* unzip from stdin */
     sunzip(0, quiet, write, over);
