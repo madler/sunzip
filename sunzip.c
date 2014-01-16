@@ -1,6 +1,6 @@
 /* sunzip.c -- streaming unzip for reading a zip file from stdin
- * Copyright (C) 2006 Mark Adler, all rights reserved
- * Version 0.33  23 July 2006  Mark Adler
+ * Copyright (C) 2006,2014 Mark Adler, all rights reserved
+ * Version 0.34  15 January 2014  Mark Adler
  */
 
 /* Version history:
@@ -42,6 +42,10 @@
                      Change pathbrk() return value to simplify usage
                      Protect against parent references ("..") in file names
                      Move name processing to after possibly getting UTF-8 name
+   0.34 15 Jan 2014  Add option to change the replacement character for ..
+                     Fix bug in the handling of extended timestamps
+                     Allow bit 11 to be set in general purpose flags
+
  */
 
 /* Notes:
@@ -77,10 +81,12 @@
 #include <dirent.h>     /* opendir(), readdir(), closedir() */
 #include "zlib.h"       /* crc32(), z_stream, inflateBackInit(), */
                         /*   inflateBack(), inflateBackEnd() */
+#ifndef JUST_DEFLATE
 #include "infback9.h"   /* inflateBack9Init(), inflate9Back(), */
                         /*   inflateBack9End() */
 #include "bzlib.h"      /* BZ2_bzDecompressInit(), BZ2_bzDecompress(), */
                         /*   BZ2_bzDecompressEnd() */
+#endif
 
 /* ----- Language Readability Enhancements (sez me) ----- */
 
@@ -132,9 +138,9 @@
 /* Unix path delimiter */
 #define PATHDELIM '/'
 
-/* Unix parent reference and replacement (must be same length) */
+/* Unix parent reference and replacement character (repeated) */
 #define PARENT ".."
-#define PARSAFE "__"
+local int parrepl = '_';
 
 /* convert a block into a string -- replace any zeros and terminate with a
    zero; this assumes that blk is at least len+1 long */
@@ -151,7 +157,7 @@ local void tostr(char *blk, unsigned len)
 /* see if it's a directory */
 local int isdir(char *path)
 {
-    unsigned len;
+    size_t len;
 
     len = strlen(path);
     return len && path[len - 1] == PATHDELIM;
@@ -161,7 +167,7 @@ local int isdir(char *path)
    name (assumes that space is available) */
 local char *pathcat(char *path)
 {
-    unsigned long len;
+    size_t len;
 
     len = strlen(path);
     path += len;
@@ -210,7 +216,8 @@ local char *guard(char *path)
         was = *cut;
         *cut = 0;
         if (strcmp(left, PARENT) == 0) {
-            strcpy(left, PARSAFE);
+            while (*left)
+                *left++ = parrepl;
             *cut = was;
             left = pathtok(cut);
             continue;
@@ -246,6 +253,7 @@ local char *guard(char *path)
    name is freed and a new malloc'ed space returned */
 local char *tohere(char *name, unsigned madeby)
 {
+    (void)madeby;
     return name;
 }
 
@@ -340,13 +348,13 @@ local void mvtempdir(char *newtemp)
     *dest = 0;
 }
 
-/* true if in the middle of a line */
+/* true if in the middle of a line on stdout */
 local int midline = 0;
 
 /* abort with an error message */
 local int bye(char *why)
 {
-    rmtempdir();
+    rmtempdir();                /* don't leave a mess behind */
     putchar(midline ? '\n' : '\r');
     fflush(stdout);
     fprintf(stderr, "sunzip abort: %s\n", why);
@@ -360,14 +368,23 @@ local long tolong(unsigned long val)
     return (long)(val & 0x7fffffffUL) - (long)(val & 0x80000000UL);
 }
 
+/* allocate memory and abort on failure */
+local void *alloc(size_t size)
+{
+    void *got;
+
+    got = malloc(size);
+    if (got == NULL)
+        bye("out of memory");
+    return got;
+}
+
 /* allocate memory and duplicate a string */
 local char *strnew(char *str)
 {
     char *ret;
 
-    ret = malloc(strlen(str) + 1);
-    if (ret == NULL)
-        bye("out of memory");
+    ret = alloc(strlen(str) + 1);
     strcpy(ret, str);
     return ret;
 }
@@ -378,7 +395,10 @@ local char *strnew(char *str)
    format, and fail if the offset is too large to fit in 11 digits (~ 10^17) */
 local char *to36(unsigned long low, unsigned long high)
 {
-    unsigned rem, tmp;
+    unsigned rem;
+#ifndef BIGLONG
+    unsigned tmp;
+#endif
     char *next;
     static char num[14];        /* good for up to 2^64 - 1 */
 
@@ -605,9 +625,7 @@ local void graft(char *path, int file, long acc, long mod)
 
         /* if it's not in the list, add it and create */
         if (*branch == NULL) {
-            *branch = malloc(sizeof(struct tree));
-            if (*branch == NULL)
-                bye("out of memory");
+            *branch = alloc(sizeof(struct tree));
             (*branch)->name = strnew(name);
             (*branch)->acc = LONG_MIN;
             (*branch)->mod = LONG_MIN;
@@ -751,6 +769,9 @@ unsigned long *skiplist;        /* skipped entry list (allocated) */
 local void skipadd(unsigned long here, unsigned long here_hi)
 {
     unsigned long size;
+#ifdef BIGLONG
+    (void)here_hi;
+#endif
 
     /* allocate or resize list if needed */
     if (skipped == skiplen) {
@@ -782,6 +803,8 @@ local int skipfind(unsigned long here, unsigned long here_hi)
     unsigned long left, right, mid, low;
 #ifndef BIGLONG
     unsigned long high;
+#else
+    (void)here_hi;
 #endif
 
     left = 1;
@@ -858,7 +881,7 @@ local void xtimes(unsigned char *extra, unsigned xlen, long *acc, long *mod)
 
     /* process Extended Timestamp block */
     if (getblock(0x5455, extra, xlen, &block, &len) && len &&
-            (*block & 1) == 0 && len >= ((*block & 2) << 1) + 5) {
+            (*block & 1) == 1 && len >= ((unsigned)(*block & 2) << 1) + 5) {
         *mod = tolong(little4(block + 1));
         *acc = *block & 2 ? tolong(little4(block + 5)) : *mod;
         return;
@@ -939,6 +962,8 @@ local char *utf8name(unsigned char *extra, unsigned xlen,
     return name;
 }
 
+#ifndef JUST_DEFLATE
+
 /* ----- BZip2 Decompression Operation ----- */
 
 #define BZOUTSIZE 32768U    /* passed outbuf better be this big */
@@ -1006,6 +1031,8 @@ local unsigned bunzip2(unsigned char *next, unsigned left,
     *back = (unsigned char *)(strm.next_in);
     return strm.avail_in;
 }
+
+#endif
 
 /* ----- Main Operations ----- */
 
@@ -1114,7 +1141,6 @@ local void sunzip(int file, int quiet, int write, int over)
     long mod;               /* last modified time for entry */
     unsigned char *tmpp;    /* temporary for field() macro */
     unsigned char *next;    /* pointer to next byte in input buffer */
-    unsigned char *back;    /* returned next pointer */
     unsigned char *inbuf;   /* input buffer */
     unsigned char *outbuf;  /* output buffer and inflate window */
     char *from, *name;      /* file name start, save area */
@@ -1125,19 +1151,22 @@ local void sunzip(int file, int quiet, int write, int over)
     struct in ins, *in = &ins;          /* input structure */
     struct out outs, *out = &outs;      /* output structure */
     z_stream strms, *strm = NULL;       /* inflate structure */
+#ifndef JUST_DEFLATE
+    unsigned char *back;                /* returned next pointer */
     z_stream strms9, *strm9 = NULL;     /* inflate9 structure */
+#endif
 
     /* initialize i/o -- note that output buffer must be 64K both for
        inflateBack9() as well as to load the maximum size name or extra
        fields */
-    inbuf = malloc(CHUNK);
+    inbuf = alloc(CHUNK);
 #ifdef BIGINT
-    outbuf = malloc(65536);
+    outbuf = alloc(65536);
 #else
     outbuf = calloc(4, 16384);
-#endif
-    if (inbuf == NULL || outbuf == NULL)
+    if (outbuf == NULL)
         bye("out of memory");
+#endif
     left = 0;
     next = inbuf;
     in->file = file;
@@ -1198,7 +1227,7 @@ local void sunzip(int file, int quiet, int write, int over)
             flag = get2(in);            /* general purpose flags */
             if ((flag & 9) == 9)
                 bye("cannot skip encrypted entry with deferred lengths");
-            if (flag & 0xfff0U)
+            if (flag & 0xf7f0U)
                 bye("unknown zip header flags set");
             method = get2(in);          /* compression method */
             if ((flag & 8) && method != 8 && method != 9 && method != 12)
@@ -1286,6 +1315,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
+#ifndef JUST_DEFLATE
             else if (method == 9) {     /* deflated with deflate64 */
                 if (strm9 == NULL) {    /* initialize first time */
                     strm9 = &strms9;
@@ -1317,6 +1347,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 }
                 next = back;
             }
+#endif
             else {                      /* skip encrpyted or unknown method */
                 if (quiet < 1)
                     bad(flag & 1 ? "skipping encrypted entry" :
@@ -1469,9 +1500,7 @@ local void sunzip(int file, int quiet, int write, int over)
                    the contents over, remove the old one, and update the name
                    of the temporary directory in tempdir[] */
                 if (matchcase(tempdir, name)) {
-                    temp = malloc(sizeof(tempdir));
-                    if (temp == NULL)
-                        bye("out of memory");
+                    temp = alloc(sizeof(tempdir));
                     strcpy(temp, TEMPDIR);
                     if (mktempdir(temp) == NULL)    /* make new directory */
                         bye("write error");
@@ -1638,8 +1667,10 @@ local void sunzip(int file, int quiet, int write, int over)
         setdirtimes(root);              /* set saved directory times */
         prune(&root);                   /* free the directory tree */
     }
+#ifndef JUST_DEFLATE
     if (strm9 != NULL)
         inflateBack9End(strm9);
+#endif
     if (strm != NULL)
         inflateBackEnd(strm);
     if (skiplist != NULL)
@@ -1657,13 +1688,14 @@ local void sunzip(int file, int quiet, int write, int over)
 /* catch interrupt in order to delete temporary files and directory */
 local void cutshort(int n)
 {
+    (void)n;
     bye("user interrupt");
 }
 
 /* process arguments and then unzip from stdin */
 int main(int argc, char **argv)
 {
-    int n;
+    int n, parm;
     int quiet = 0, write = 1, over = 0;
     char *arg;
 
@@ -1675,12 +1707,13 @@ int main(int argc, char **argv)
 
     /* give help if input not redirected */
     if (isatty(0)) {
-        puts("sunzip 0.33, streaming unzip by Mark Adler");
-        puts("usage: ... | sunzip [-t] [-o] [-q[q]] [dir]");
-        puts("       sunzip [-q[q]] [dir] < infile.zip");
+        puts("sunzip 0.34, streaming unzip by Mark Adler");
+        puts("usage: ... | sunzip [-t] [-o] [-p x] [-q[q]] [dir]");
+        puts("       sunzip [-t] [-o] [-p x] [-q[q]] [dir] < infile.zip");
         puts("");
         puts("\t-t: test -- don't write files");
         puts("\t-o: overwrite existing files");
+        puts("\t-p x: replace parent reference with this character");
         puts("\t-q: quiet -- display summary info and errors only");
         puts("\t-qq: really quiet -- display errors only");
         puts("\tdir: subdirectory to create files in (if writing)");
@@ -1688,13 +1721,23 @@ int main(int argc, char **argv)
     }
 
     /* scan options in arguments */
+    parm = 0;
     for (n = 1; n < argc; n++)
-        if (argv[n][0] == '-') {
+        if (parm) {
+            parrepl = argv[n][0];
+            if (parrepl == 0 || argv[n][1])
+                bye("need one character after -p");
+            parm = 0;
+        }
+        else if (argv[n][0] == '-') {
             arg = argv[n] + 1;
             while (*arg) {
                 switch (*arg) {
                 case 'o':           /* overwrite existing files */
                     over = 1;
+                    break;
+                case 'p':           /* parent ".." replacement character */
+                    parm = 1;       /* get character in next arg */
                     break;
                 case 'q':           /* quiet */
                     quiet++;        /* qq is even more quiet */
@@ -1710,14 +1753,26 @@ int main(int argc, char **argv)
         }
 
     /* check option consistency */
+    if (parm)
+        bye("nothing after -p");
     if (over && !write)
         bye("can't combine -o with -t");
+    if (parrepl == '.')
+        fputs("sunzip warning: parent directory access allowed\n", stderr);
 
     /* scan non-options, which is where to create and put entries in -- the
        directory is created and then we cd in there, multiple name arguments
        simply create deeper subdirectories for the destination */
     for (n = 1; n < argc; n++)
-        if (argv[n][0] != '-') {
+        if (parm)
+            parm = 0;
+        else if (argv[n][0] == '-') {
+            arg = argv[n] + 1;
+            while (*arg)
+                if (*arg++ == 'p')
+                    parm = 1;
+        }
+        else {
             if (!write)
                 bye("cannot specify destination directory with -t");
             mkpath(argv[n]);
