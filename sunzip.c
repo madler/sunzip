@@ -1744,7 +1744,7 @@ int main(int argc, char **argv)
         puts("");
         puts("\t-t: test -- don't write files");
         puts("\t-o: overwrite existing files");
-        puts("\t-p x: replace parent reference with this character");
+        puts("\t-p x: replace parent reference .. with this character");
         puts("\t-q: quiet -- display summary info and errors only");
         puts("\t-qq: really quiet -- display errors only");
         puts("\tdir: subdirectory to create files in (if writing)");
