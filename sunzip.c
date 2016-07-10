@@ -45,13 +45,14 @@
    0.34 15 Jan 2014  Add option to change the replacement character for ..
                      Fix bug in the handling of extended timestamps
                      Allow bit 11 to be set in general purpose flags
-   0.4x xx Jul 2016  -
+   0.4x xx Jul 2016  Use blast for DCL imploded entries (method 10)
 
  */
 
 /* Notes:
-   - Link sunzip with zlib 1.2.3 or later, infback9.c and inftree9.c compiled
-     (found in the zlib source distribution contrib/ directory), and libbzip2.
+   - Compile and link sunzip with zlib 1.2.3 or later, infback9.c and
+     inftree9.c (found in the zlib source distribution in contrib/infback9),
+     blast.c from zlib 1.2.9 or later (found in contrib/blast), and libbzip2.
  */
 
 /* To-do:
@@ -85,6 +86,7 @@
 #ifndef JUST_DEFLATE
 #include "infback9.h"   /* inflateBack9Init(), inflate9Back(), */
                         /*   inflateBack9End() */
+#include "blast.h"      /* blast() */
 #include "bzlib.h"      /* BZ2_bzDecompressInit(), BZ2_bzDecompress(), */
                         /*   BZ2_bzDecompressEnd() */
 #endif
@@ -1335,6 +1337,14 @@ local void sunzip(int file, int quiet, int write, int over)
                 next = strm9->next_in;
                 if (ret != Z_STREAM_END) {
                     bad("deflate64 compressed data corrupted",
+                        entries, here, here_hi);
+                    bye("zip file corrupted -- cannot continue");
+                }
+            }
+            else if (method == 10) {    /* PKWare DCL implode */
+                ret = blast(get, in, put, out, &left, &next);
+                if (ret != 0) {
+                    bad("DCL imploded data corrupted",
                         entries, here, here_hi);
                     bye("zip file corrupted -- cannot continue");
                 }
