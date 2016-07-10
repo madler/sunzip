@@ -59,6 +59,7 @@
    - Set EIGHTDOT3 for file systems that so restrict the file names
    - Tailor path name operations for different operating systems
    - Set the long data descriptor signature once it's specified by PKWare
+     (looks like that will never happen)
    - Handle the entry name "-" differently?  (Created by piped zip.)
  */
 
