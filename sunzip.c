@@ -1,6 +1,24 @@
 /* sunzip.c -- streaming unzip for reading a zip file from stdin
- * Copyright (C) 2006, 2014, 2016 Mark Adler, all rights reserved
- * Version 0.4x  xx July 2016  Mark Adler
+  Copyright (C) 2006, 2014, 2016 Mark Adler
+  version 0.4x  xx July 2016
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the author be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Mark Adler    madler@alumni.caltech.edu
  */
 
 /* Version history:
@@ -46,6 +64,7 @@
                      Fix bug in the handling of extended timestamps
                      Allow bit 11 to be set in general purpose flags
    0.4x xx Jul 2016  Use blast for DCL imploded entries (method 10)
+                     Add zlib license
 
  */
 
