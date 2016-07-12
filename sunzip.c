@@ -1278,7 +1278,7 @@ local void sunzip(int file, int quiet, int write, int over)
 
             /* create temporary file (including for directories and links) */
             if (write && (method == 0 || method == 8 || method == 9 ||
-                          method == 12)) {
+                          method == 10 || method == 12)) {
                 strcpy(temp, to36(here, here_hi));
                 out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
                 if (out->file == -1)
@@ -1460,7 +1460,8 @@ local void sunzip(int file, int quiet, int write, int over)
             }
 
             /* verify entry and display information (won't do if skipped) */
-            if (method == 0 || method == 8 || method == 9 || method == 12) {
+            if (method == 0 || method == 8 || method == 9 || method == 10 ||
+                method == 12) {
                 if (!GOOD()) {
                     bad("compressed data corrupted, check values mismatch",
                         entries, here, here_hi);
