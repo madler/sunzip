@@ -28,12 +28,73 @@ Compile and link with zlib, infback9.c and inftree9.c (found in zlib's contrib
 directory), blast.c (also in contrib), and libbz2. blast.c from zlib 1.2.9 or
 later must be used.
 
-Test
-----
 
-`cat any.zip | sunzip`
+### Example: Debian/Ubuntu
+
+The below example compiles a recent [zlib](https://github.com/madler/zlib) that is 
+installed to `/usr/local/lib` - then `contrib/blast` and `contrib/infback9`
+before finally downloading and compiling `sunzip.c`. 
+
+Modify the URLs below to use different versions.
+
+```
+apt-get -y install build-essential libbz2-dev curl ca-certificates
+cd /tmp
+
+curl -L -o zlib.tar.gz https://github.com/madler/zlib/archive/v1.2.11.tar.gz
+tar zxfv zlib.tar.gz
+mv zlib-* zlib && cd zlib
+./configure && make
+sudo make install
+
+cd contrib/blast
+gcc -O3 -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN  -I .  -I ../../ -c -Wall -Werror -fpic blast.c
+cd ../infback9
+gcc  -O3 -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN  -I .  -I ../../ -c -Wall -Werror -fpic infback9.c inftree9.c
+
+cd /tmp
+curl -L -o sunzip.tar.gz https://github.com/madler/sunzip/archive/v0.4.tar.gz
+tar zxfv sunzip.tar.gz
+cd sunzip-*
+gcc  -O3 -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN \
+  -I ../zlib/contrib/infback9 \
+  -I ../zlib/contrib/blast \
+  -I ../zlib/contrib/bz \
+  -I /usr/local/include \
+  -L /usr/local/lib \
+  -Wl,-rpath=/usr/local/lib \
+  -o sunzip \
+  ../zlib/zutil.o \
+  ../zlib/contrib/blast/blast.o \
+  ../zlib/contrib/infback9/infback9.o  \
+  ../zlib/contrib/infback9/inftree9.o  \
+  sunzip.c -lbz2 -lz
+
+sudo cp sunzip /usr/local/bin
+sunzip
+```
+
+Usage
+-----
+
+    cat any.zip | sunzip
+
+For help, run `sunzip` without arguments on a terminal:
+
+```
+sunzip 0.4, streaming unzip by Mark Adler
+usage: ... | sunzip [-t] [-o] [-p x] [-q[q]] [dir]
+       sunzip [-t] [-o] [-p x] [-q[q]] [dir] < infile.zip
+
+	-t: test -- don't write files
+	-o: overwrite existing files
+	-p x: replace parent reference .. with this character
+	-q: quiet -- display summary info and errors only
+	-qq: really quiet -- display errors only
+	dir: subdirectory to create files in (if writing)
+```
 
 License
 -------
 
-This code is under the zlib license, permitting free commercial use.
+This code is under the [zlib license](sunzip.c), permitting free commercial use.
