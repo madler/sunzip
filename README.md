@@ -37,7 +37,7 @@ before finally downloading and compiling `sunzip.c`.
 
 Modify the URLs below to use different versions.
 
-```
+```bash
 apt-get -y install build-essential libbz2-dev curl ca-certificates
 cd /tmp
 
@@ -92,6 +92,34 @@ usage: ... | sunzip [-t] [-o] [-p x] [-q[q]] [dir]
 	-q: quiet -- display summary info and errors only
 	-qq: really quiet -- display errors only
 	dir: subdirectory to create files in (if writing)
+```
+
+Docker
+------
+
+If you have [Docker](https://www.docker.com/), you can build a 
+Debian-compatible binary using:
+
+    docker build -t madler/sunzip .
+
+The docker image has the `/data` volume as default working 
+directory where files will be extracted. 
+
+The below example extract from a ZIP URL and extracts it into
+the host `/tmp/1` exposed as `/data`. 
+
+
+    URL=https://github.com/madler/sunzip/archive/master.zip
+    curl --fail -L $URL | docker run -i -v /tmp/1:/data madler/sunzip
+
+**Tip**: To avoid extracted files owned by `root` make sure the mapped 
+directory exists and specify the Docker option `--user` with your UID:
+
+```bash
+    mkdir /tmp/5
+    URL=https://github.com/madler/sunzip/archive/master.zip
+    curl --fail -L $URL | docker run --user `id -u` -i -v /tmp/5:/data madler/sunzip
+    ls -al /tmp/5
 ```
 
 License
