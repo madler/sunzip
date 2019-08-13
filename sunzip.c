@@ -65,6 +65,7 @@
                      Allow bit 11 to be set in general purpose flags
    0.4  11 Jul 2016  Use blast for DCL imploded entries (method 10)
                      Add zlib license
+   NEXT xx xxx 2019  Add -l list option to only list filenames
 
  */
 
@@ -1127,8 +1128,8 @@ local void bad(char *why, unsigned long entry,
    limit output if quiet is 1, more so if quiet is >= 2, write the decompressed
    data to files if write is true, otherwise just verify the entries, overwrite
    existing files if over is true, otherwise don't -- over must not be true if
-   write is false */
-local void sunzip(int file, int quiet, int write, int over)
+   write is false; if list is true, only print file names  */
+local void sunzip(int file, int quiet, int write, int over, int list)
 {
     enum {                      /* looking for ... */
         MARK,                   /* spanning signature (optional) */
@@ -1265,8 +1266,21 @@ local void sunzip(int file, int quiet, int write, int over)
             nlen = get2(in);            /* file name length */
             xlen = get2(in);            /* extra field length */
 
-            /* skip file name (will get from central directory later) */
-            skip(nlen, in);
+            if (list) {
+                /* read file name for listing */
+                field(nlen, in);
+                tmp = crc32(crc32(0L, Z_NULL, 0), outbuf, nlen);    /* name crc */
+                from = (char *)outbuf;
+                tostr(from, nlen);              /* make name into a string */
+                name = strnew(from);            /* copy from outbuf */
+
+                // We will print later, as we have to check for UTF-8
+                //outbuf[nlen] = '\0';
+                //printf("%s\n", outbuf); // TODO: encoding etc
+            } else {
+                /* skip file name field */
+                skip(nlen, in);
+            }
 
             /* process extra field -- get entry times if there and, if needed,
                get zip64 lengths */
@@ -1275,6 +1289,14 @@ local void sunzip(int file, int quiet, int write, int over)
             if (!(flag & 8) && (clen == LOW4 || ulen == LOW4))
                 high = zip64local(outbuf, xlen,
                                   &clen, &clen_hi, &ulen, &ulen_hi);
+
+            if (list) {
+                /* check for replacement utf8 name in extra field */
+                name = utf8name(outbuf, xlen, tmp, name);
+                name = tohere(name, madeby);    /* convert name for this OS */
+                name = guard(name);             /* keep the name safe */
+                printf("%s\n", name);
+            }
 
             /* create temporary file (including for directories and links) */
             if (write && (method == 0 || method == 8 || method == 9 ||
@@ -1297,7 +1319,7 @@ local void sunzip(int file, int quiet, int write, int over)
             /* process compressed data */
             if (flag & 1)
                 method = UINT_MAX;
-            if (method == 0) {          /* stored */
+            if (!list && method == 0) {          /* stored */
                 if (clen != ulen || clen_hi != ulen_hi)
                     bye("zip file format error (stored lengths mismatch)");
                 while (clen_hi || clen > left) {
@@ -1316,7 +1338,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 clen = ulen;
                 clen_hi = ulen_hi;
             }
-            else if (method == 8) {     /* deflated */
+            else if (!list && method == 8) {     /* deflated */
                 if (strm == NULL) {     /* initialize inflater first time */
                     strm = &strms;
                     strm->zalloc = Z_NULL;
@@ -1339,7 +1361,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 }
             }
 #ifndef JUST_DEFLATE
-            else if (method == 9) {     /* deflated with deflate64 */
+            else if (!list && method == 9) {     /* deflated with deflate64 */
                 if (strm9 == NULL) {    /* initialize first time */
                     strm9 = &strms9;
                     strm9->zalloc = Z_NULL;
@@ -1361,7 +1383,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
-            else if (method == 10) {    /* PKWare DCL implode */
+            else if (!list && method == 10) {    /* PKWare DCL implode */
                 ret = blast(get, in, put, out, &left, &next);
                 if (ret != 0) {
                     bad("DCL imploded data corrupted",
@@ -1369,7 +1391,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
-            else if (method == 12) {    /* bzip2 compression */
+            else if (!list && method == 12) {    /* bzip2 compression */
                 left = bunzip2(next, left, in, out, outbuf, &back);
                 if (back == NULL) {
                     bad("bzip2 compressed data corrupted",
@@ -1379,8 +1401,8 @@ local void sunzip(int file, int quiet, int write, int over)
                 next = back;
             }
 #endif
-            else {                      /* skip encrpyted or unknown method */
-                if (quiet < 1)
+            else {                      /* skip (encrypted or unknown method?) */
+                if (!list && quiet < 1)
                     bad(flag & 1 ? "skipping encrypted entry" :
                         "skipping unknown compression method",
                         entries, here, here_hi);
@@ -1460,8 +1482,8 @@ local void sunzip(int file, int quiet, int write, int over)
             }
 
             /* verify entry and display information (won't do if skipped) */
-            if (method == 0 || method == 8 || method == 9 || method == 10 ||
-                method == 12) {
+            if (! list && (method == 0 || method == 8 || method == 9 || method == 10 ||
+                method == 12)) {
                 if (!GOOD()) {
                     bad("compressed data corrupted, check values mismatch",
                         entries, here, here_hi);
@@ -1693,7 +1715,8 @@ local void sunzip(int file, int quiet, int write, int over)
     } until (mode == END);              /* until end record reached (or EOF) */
 
     /* summarize and clean up */
-    summary(entries, exist, write, quiet);
+    if (! list)
+        summary(entries, exist, write, quiet);
     if (write) {
         rmtempdir();                    /* remove the temporary directory */
         setdirtimes(root);              /* set saved directory times */
@@ -1728,7 +1751,7 @@ local void cutshort(int n)
 int main(int argc, char **argv)
 {
     int n, parm;
-    int quiet = 0, write = 1, over = 0;
+    int quiet = 0, write = 1, over = 0, list = 0;
     char *arg;
 
     /* for rmtempdir(), called by bye() */
@@ -1744,6 +1767,7 @@ int main(int argc, char **argv)
         puts("       sunzip [-t] [-o] [-p x] [-q[q]] [dir] < infile.zip");
         puts("");
         puts("\t-t: test -- don't write files");
+        puts("\t-l: list zip filenames -- don't write files");
         puts("\t-o: overwrite existing files");
         puts("\t-p x: replace parent reference .. with this character");
         puts("\t-q: quiet -- display summary info and errors only");
@@ -1776,6 +1800,11 @@ int main(int argc, char **argv)
                     break;
                 case 't':           /* test */
                     write = 0;
+                    break;
+                case 'l':           /* list */
+                    write = 0;
+                    quiet = 2;
+                    list = 1;
                     break;
                 default:
                     bye("unknown option");
@@ -1813,6 +1842,6 @@ int main(int argc, char **argv)
         }
 
     /* unzip from stdin */
-    sunzip(0, quiet, write, over);
+    sunzip(0, quiet, write, over, list);
     return 0;
 }
