@@ -1254,6 +1254,8 @@ local void sunzip(int file, int quiet, int write, int over, int list)
             if (flag & 0xf7f0U)
                 bye("unknown zip header flags set");
             method = get2(in);          /* compression method */
+            if ((flag & 8) && list)
+                bye("cannot handle deferred lengths without decompressing (try -t)");
             if ((flag & 8) && method != 8 && method != 9 && method != 12)
                 bye("cannot handle deferred lengths for pre-deflate methods");
             acc = mod = dos2time(get4(in));     /* file date/time */
