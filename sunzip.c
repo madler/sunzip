@@ -65,7 +65,7 @@
                      Allow bit 11 to be set in general purpose flags
    0.4  11 Jul 2016  Use blast for DCL imploded entries (method 10)
                      Add zlib license
-
+   0.41 10 Sep 2019  Enable streaming output
  */
 
 /* Notes:
@@ -1276,12 +1276,12 @@ local void sunzip(int file, int quiet, int write, int over, int stdo)
                 high = zip64local(outbuf, xlen,
                                   &clen, &clen_hi, &ulen, &ulen_hi);
 
-			/* use stdout */
-			if (stdo) {
-				out->file = STDOUT_FILENO;
+            /* use stdout */
+            if (stdo) {
+                out->file = STDOUT_FILENO;
             }
             /* create temporary file (including for directories and links) */
-			else if (write && (method == 0 || method == 8 || method == 9 ||
+            else if (write && (method == 0 || method == 8 || method == 9 ||
                           method == 10 || method == 12)) {
                 strcpy(temp, to36(here, here_hi));
                 out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
@@ -1781,7 +1781,7 @@ int main(int argc, char **argv)
                     break;
                 case 's':           /* use stdout instead of files */
                     stdo = 1;
-					write = 0;
+                    write = 0;
                     break;
                 case 't':           /* test */
                     write = 0;
