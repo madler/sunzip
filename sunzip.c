@@ -65,7 +65,7 @@
                      Allow bit 11 to be set in general purpose flags
    0.4  11 Jul 2016  Use blast for DCL imploded entries (method 10)
                      Add zlib license
-
+   0.41 10 Sep 2019  Enable streaming output
  */
 
 /* Notes:
@@ -1079,10 +1079,10 @@ local void summary(unsigned long entries, unsigned long exist,
 
     if (quiet < 2) {
         written = entries - exist - skipped;
-        printf("%lu entr%s %s", written, written == 1 ? "y" : "ies",
+        fprintf(stderr, "%lu entr%s %s", written, written == 1 ? "y" : "ies",
                    write ? "written" : "verified");
         if (exist)
-            printf(", %lu not overwritten", exist);
+            fprintf(stderr, ", %lu not overwritten", exist);
         putchar('\n');
     }
     if (skipped) {
@@ -1128,7 +1128,7 @@ local void bad(char *why, unsigned long entry,
    data to files if write is true, otherwise just verify the entries, overwrite
    existing files if over is true, otherwise don't -- over must not be true if
    write is false */
-local void sunzip(int file, int quiet, int write, int over)
+local void sunzip(int file, int quiet, int write, int over, int stdo)
 {
     enum {                      /* looking for ... */
         MARK,                   /* spanning signature (optional) */
@@ -1241,8 +1241,8 @@ local void sunzip(int file, int quiet, int write, int over)
             mode = LOCAL;
             entries++;
             if (quiet < 2 && entries % 100 == 0) {
-                printf("\r%lu", entries);
-                fflush(stdout);
+                fprintf(stderr, "\r%lu", entries);
+                fflush(stderr);
             }
 
             /* process local header */
@@ -1276,8 +1276,12 @@ local void sunzip(int file, int quiet, int write, int over)
                 high = zip64local(outbuf, xlen,
                                   &clen, &clen_hi, &ulen, &ulen_hi);
 
+            /* use stdout */
+            if (stdo) {
+                out->file = STDOUT_FILENO;
+            }
             /* create temporary file (including for directories and links) */
-            if (write && (method == 0 || method == 8 || method == 9 ||
+            else if (write && (method == 0 || method == 8 || method == 9 ||
                           method == 10 || method == 12)) {
                 strcpy(temp, to36(here, here_hi));
                 out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
@@ -1474,7 +1478,7 @@ local void sunzip(int file, int quiet, int write, int over)
             /* first time here: any earlier mode can arrive here */
             if (mode < CENTRAL) {
                 if (quiet < 2)
-                    printf("\r%lu entr%s processed\n",
+                    fprintf(stderr, "\r%lu entr%s processed\n",
                            entries, entries == 1 ? "y" : "ies");
                 mode = CENTRAL;
             }
@@ -1728,7 +1732,7 @@ local void cutshort(int n)
 int main(int argc, char **argv)
 {
     int n, parm;
-    int quiet = 0, write = 1, over = 0;
+    int quiet = 0, write = 1, over = 0, stdo = 0;
     char *arg;
 
     /* for rmtempdir(), called by bye() */
@@ -1740,11 +1744,12 @@ int main(int argc, char **argv)
     /* give help if input not redirected */
     if (isatty(0)) {
         puts("sunzip 0.4, streaming unzip by Mark Adler");
-        puts("usage: ... | sunzip [-t] [-o] [-p x] [-q[q]] [dir]");
+        puts("usage: ... | sunzip [-t] [-o] [-s] [-p x] [-q[q]] [dir]");
         puts("       sunzip [-t] [-o] [-p x] [-q[q]] [dir] < infile.zip");
         puts("");
         puts("\t-t: test -- don't write files");
         puts("\t-o: overwrite existing files");
+        puts("\t-s: cat files to stdout instead of disk");
         puts("\t-p x: replace parent reference .. with this character");
         puts("\t-q: quiet -- display summary info and errors only");
         puts("\t-qq: really quiet -- display errors only");
@@ -1774,6 +1779,10 @@ int main(int argc, char **argv)
                 case 'q':           /* quiet */
                     quiet++;        /* qq is even more quiet */
                     break;
+                case 's':           /* use stdout instead of files */
+                    stdo = 1;
+                    write = 0;
+                    break;
                 case 't':           /* test */
                     write = 0;
                     break;
@@ -1788,7 +1797,7 @@ int main(int argc, char **argv)
     if (parm)
         bye("nothing after -p");
     if (over && !write)
-        bye("can't combine -o with -t");
+        bye("can't combine -o with -t or -s");
     if (parrepl == '.')
         fputs("sunzip warning: parent directory access allowed\n", stderr);
 
@@ -1806,13 +1815,13 @@ int main(int argc, char **argv)
         }
         else {
             if (!write)
-                bye("cannot specify destination directory with -t");
+                bye("cannot specify destination directory with -t or -s");
             mkpath(argv[n]);
             if (chdir(argv[n]))
                 bye("write error");
         }
 
     /* unzip from stdin */
-    sunzip(0, quiet, write, over);
+    sunzip(0, quiet, write, over, stdo);
     return 0;
 }
