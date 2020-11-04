@@ -65,6 +65,9 @@
                      Allow bit 11 to be set in general purpose flags
    0.4  11 Jul 2016  Use blast for DCL imploded entries (method 10)
                      Add zlib license
+   NEXT xx xxx 2020  Add constants for zip constants.
+                     Fix bug in GOOD macro that was susceptible to get/load
+                     increasing the in->count by CHUNK bytes
 
  */
 
@@ -110,6 +113,22 @@
 #include "bzlib.h"      /* BZ2_bzDecompressInit(), BZ2_bzDecompress(), */
                         /*   BZ2_bzDecompressEnd() */
 #endif
+
+// zip spec constants. (Listed here to avoid magic numbers throughout the code.)
+#define COMPR_METHOD_STORED            0
+#define COMPR_METHOD_DEFLATE           8
+#define COMPR_METHOD_DEFLATE64         9
+#define COMPR_METHOD_PK_DCL_IMPLODE    10
+#define COMPR_METHOD_BZIP2             12
+
+#define HDR_SIG_SPANNING_MARKER_PARTIAL_ARCHIVE 0x08074b50UL
+#define HDR_SIG_NON_SPLIT_SPANNING_MARKER       0x30304b50UL
+#define HDR_SIG_LOCAL_FILE_HEADER               0x04034b50UL
+#define HDR_SIG_CENTRAL_FILE_HEADER             0x02014b50UL
+#define HDR_SIG_DIGITAL_SIGNATURE               0x05054b50UL
+#define HDR_SIG_ZIP64_END_CENTRAL_DIR_REC       0x06064b50UL
+#define HDR_SIG_ZIP64_END_CENTRAL_DIR_LOC       0x07064b50UL
+#define HDR_SIG_END_CENTRAL_DIR_REC             0x06054b50UL
 
 /* ----- Language Readability Enhancements (sez me) ----- */
 
@@ -269,15 +288,6 @@ local char *guard(char *path)
 
     /* return secured path */
     return path;
-}
-
-/* convert name from source to current operating system, using the information
-   in the madeby value from the central directory -- name updated in place or
-   name is freed and a new malloc'ed space returned */
-local char *tohere(char *name, unsigned madeby)
-{
-    (void)madeby;
-    return name;
 }
 
 /* ----- Utility Operations ----- */
@@ -1113,13 +1123,16 @@ local void bad(char *why, unsigned long entry,
 /* macro to check actual crc and lengths against expected */
 #ifdef BIGLONG
 #  define GOOD() (out->crc == crc && \
-    clen == (in->count & LOW4) && ulen == (out->count & LOW4) && \
-    (high ? clen_hi == (in->count >> 32) && \
-            ulen_hi == (out->count >> 32) : 1))
+                  (clen == (reclen & LOW4) ) &&    \
+                  ulen == (out->count & LOW4) &&   \
+                  (high                            \
+                   ? clen_hi == (reclen >> 32) &&  \
+                     ulen_hi == (out->count >> 32) \
+                   : 1))
 #else
 #  define GOOD() (out->crc == crc && \
-    clen == in->count && ulen == out->count && \
-    (high ? clen_hi == in->count_hi && \
+    clen == reclen && ulen == out->count &&        \
+    (high ? clen_hi == reclen_hi &&                \
             ulen_hi == out->count_hi : 1))
 #endif
 
@@ -1155,6 +1168,8 @@ local void sunzip(int file, int quiet, int write, int over)
     unsigned long here_hi;  /* high part of offset */
     unsigned long tmp;      /* temporary long */
     unsigned long crc;      /* cyclic redundancy check from header */
+    unsigned long reclen;   /* record length */
+    unsigned long reclen_hi; /* high part of eight-byte record length */
     unsigned long clen;     /* compressed length from header */
     unsigned long clen_hi;  /* high part of eight-byte compressed length */
     unsigned long ulen;     /* uncompressed length from header */
@@ -1223,19 +1238,19 @@ local void sunzip(int file, int quiet, int write, int over)
         /* get and interpret next header signature */
         switch (get4(in)) {
 
-        case 0x08074b50UL:      /* spanning marker -- partial archive */
+        case HDR_SIG_SPANNING_MARKER_PARTIAL_ARCHIVE:      /* spanning marker -- partial archive */
             if (mode != MARK)
                 bye("zip file format error (spanning marker misplaced)");
             bye("cannot process split zip archives");
             break;
 
-        case 0x30304b50UL:      /* non-split spanning marker (ignore) */
+        case HDR_SIG_NON_SPLIT_SPANNING_MARKER:      /* non-split spanning marker (ignore) */
             if (mode != MARK)
                 bye("zip file format error (spanning marker misplaced)");
             mode = LOCAL;
             break;
 
-        case 0x04034b50UL:      /* local file header */
+        case HDR_SIG_LOCAL_FILE_HEADER:      /* local file header */
             if (mode > LOCAL)
                 bye("zip file format error (local file header misplaced)");
             mode = LOCAL;
@@ -1253,8 +1268,13 @@ local void sunzip(int file, int quiet, int write, int over)
             if (flag & 0xf7f0U)
                 bye("unknown zip header flags set");
             method = get2(in);          /* compression method */
-            if ((flag & 8) && method != 8 && method != 9 && method != 12)
+            if ((flag & 8) && method != COMPR_METHOD_STORED
+                           && method != COMPR_METHOD_DEFLATE
+                           && method != COMPR_METHOD_DEFLATE64
+                           && method != COMPR_METHOD_BZIP2) {
+                printf("method:%d\n", method);
                 bye("cannot handle deferred lengths for pre-deflate methods");
+            }
             acc = mod = dos2time(get4(in));     /* file date/time */
             crc = get4(in);             /* uncompressed CRC check value */
             clen = get4(in);            /* compressed size */
@@ -1277,8 +1297,11 @@ local void sunzip(int file, int quiet, int write, int over)
                                   &clen, &clen_hi, &ulen, &ulen_hi);
 
             /* create temporary file (including for directories and links) */
-            if (write && (method == 0 || method == 8 || method == 9 ||
-                          method == 10 || method == 12)) {
+            if (write && (method == COMPR_METHOD_STORED ||
+                          method == COMPR_METHOD_DEFLATE ||
+                          method == COMPR_METHOD_DEFLATE64 ||
+                          method == COMPR_METHOD_PK_DCL_IMPLODE ||
+                          method == COMPR_METHOD_BZIP2)) {
                 strcpy(temp, to36(here, here_hi));
                 out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
                 if (out->file == -1)
@@ -1297,7 +1320,7 @@ local void sunzip(int file, int quiet, int write, int over)
             /* process compressed data */
             if (flag & 1)
                 method = UINT_MAX;
-            if (method == 0) {          /* stored */
+            if (method == COMPR_METHOD_STORED) {          /* stored */
                 if (clen != ulen || clen_hi != ulen_hi)
                     bye("zip file format error (stored lengths mismatch)");
                 while (clen_hi || clen > left) {
@@ -1316,7 +1339,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 clen = ulen;
                 clen_hi = ulen_hi;
             }
-            else if (method == 8) {     /* deflated */
+            else if (method == COMPR_METHOD_DEFLATE) {     /* deflated */
                 if (strm == NULL) {     /* initialize inflater first time */
                     strm = &strms;
                     strm->zalloc = Z_NULL;
@@ -1339,7 +1362,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 }
             }
 #ifndef JUST_DEFLATE
-            else if (method == 9) {     /* deflated with deflate64 */
+            else if (method == COMPR_METHOD_DEFLATE64) {     /* deflated with deflate64 */
                 if (strm9 == NULL) {    /* initialize first time */
                     strm9 = &strms9;
                     strm9->zalloc = Z_NULL;
@@ -1361,7 +1384,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
-            else if (method == 10) {    /* PKWare DCL implode */
+            else if (method == COMPR_METHOD_PK_DCL_IMPLODE) {    /* PKWare DCL implode */
                 ret = blast(get, in, put, out, &left, &next);
                 if (ret != 0) {
                     bad("DCL imploded data corrupted",
@@ -1369,7 +1392,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
-            else if (method == 12) {    /* bzip2 compression */
+            else if (method == COMPR_METHOD_BZIP2) {    /* bzip2 compression */
                 left = bunzip2(next, left, in, out, outbuf, &back);
                 if (back == NULL) {
                     bad("bzip2 compressed data corrupted",
@@ -1379,7 +1402,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 next = back;
             }
 #endif
-            else {                      /* skip encrpyted or unknown method */
+            else {                      /* skip encrypted or unknown method */
                 if (quiet < 1)
                     bad(flag & 1 ? "skipping encrypted entry" :
                         "skipping unknown compression method",
@@ -1398,6 +1421,11 @@ local void sunzip(int file, int quiet, int write, int over)
             if (in->count < left)
                 in->count_hi--;
             in->count -= left;
+            /* Cache the record length since loading additional bytes
+             * to check the header signature can cause in->count to
+             * increase by CHUNK bytes */
+            reclen = in->count;
+            reclen_hi = in->count_hi;
 
             /* close file, set file times */
             if (out->file != -1) {
@@ -1427,7 +1455,8 @@ local void sunzip(int file, int quiet, int write, int over)
                 if (!GOOD()) {
                     /* look for an Info-ZIP descriptor (original -- in use) */
                     /* (%% NOTE: replace second signature when actual known) */
-                    if (crc == 0x08074b50UL || crc == 0x08074b50UL) {
+                    if (crc == HDR_SIG_SPANNING_MARKER_PARTIAL_ARCHIVE ||
+                        crc == HDR_SIG_SPANNING_MARKER_PARTIAL_ARCHIVE) {
                         tmp = crc;      /* temporary hold for signature */
                         crc = clen;
                         clen = ulen;
@@ -1460,8 +1489,11 @@ local void sunzip(int file, int quiet, int write, int over)
             }
 
             /* verify entry and display information (won't do if skipped) */
-            if (method == 0 || method == 8 || method == 9 || method == 10 ||
-                method == 12) {
+            if (method == COMPR_METHOD_STORED ||
+                method == COMPR_METHOD_DEFLATE ||
+                method == COMPR_METHOD_DEFLATE64 ||
+                method == COMPR_METHOD_PK_DCL_IMPLODE ||
+                method == COMPR_METHOD_BZIP2) {
                 if (!GOOD()) {
                     bad("compressed data corrupted, check values mismatch",
                         entries, here, here_hi);
@@ -1470,7 +1502,7 @@ local void sunzip(int file, int quiet, int write, int over)
             }
             break;
 
-        case 0x02014b50UL:      /* central file header */
+        case HDR_SIG_CENTRAL_FILE_HEADER:      /* central file header */
             /* first time here: any earlier mode can arrive here */
             if (mode < CENTRAL) {
                 if (quiet < 2)
@@ -1515,7 +1547,6 @@ local void sunzip(int file, int quiet, int write, int over)
             name = utf8name(outbuf, xlen, tmp, name);
 
             /* process file name */
-            name = tohere(name, madeby);    /* convert name for this OS */
             name = guard(name);             /* keep the name safe */
 
             /* If tempdir and name collide (pretty darned unlikely, but not
@@ -1650,14 +1681,14 @@ local void sunzip(int file, int quiet, int write, int over)
             skip(flag, in);
             break;
 
-        case 0x05054b50UL:      /* digital signature */
+        case HDR_SIG_DIGITAL_SIGNATURE:      /* digital signature */
             if (mode != CENTRAL)
                 bye("zip file format error (digital signature misplaced)");
             mode = DIGSIG;
             skip(get2(in), in);
             break;
 
-        case 0x06064b50UL:      /* zip64 end of central directory record */
+        case HDR_SIG_ZIP64_END_CENTRAL_DIR_REC:      /* zip64 end of central directory record */
             if (mode != CENTRAL && mode != DIGSIG)
                 bye("zip file format error (zip64 record misplaced)");
             mode = ZIP64REC;
@@ -1671,14 +1702,14 @@ local void sunzip(int file, int quiet, int write, int over)
             }
             break;
 
-        case 0x07064b50UL:      /* zip64 end of central directory locator */
+        case HDR_SIG_ZIP64_END_CENTRAL_DIR_LOC:      /* zip64 end of central directory locator */
             if (mode != ZIP64REC)
                 bye("zip file format error (zip64 locator misplaced)");
             mode = ZIP64LOC;
             skip(16, in);
             break;
 
-        case 0x06054b50UL:      /* end of central directory record */
+        case HDR_SIG_END_CENTRAL_DIR_REC:      /* end of central directory record */
             if (mode == LOCAL || mode == ZIP64REC || mode == END)
                 bye("zip file format error (end record misplaced)");
             mode = END;
