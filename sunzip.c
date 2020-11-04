@@ -1268,8 +1268,6 @@ local void sunzip(int file, int quiet, int write, int over)
             if (flag & 0xf7f0U)
                 bye("unknown zip header flags set");
             method = get2(in);          /* compression method */
-            if ((flag & 8) && list)
-                bye("cannot handle deferred lengths without decompressing (try -t)");
             if ((flag & 8) && method != COMPR_METHOD_STORED
                            && method != COMPR_METHOD_DEFLATE
                            && method != COMPR_METHOD_DEFLATE64
@@ -1495,7 +1493,7 @@ local void sunzip(int file, int quiet, int write, int over)
                 method == COMPR_METHOD_DEFLATE ||
                 method == COMPR_METHOD_DEFLATE64 ||
                 method == COMPR_METHOD_PK_DCL_IMPLODE ||
-                method == COMPR_METHOD_BZIP2)) {
+                method == COMPR_METHOD_BZIP2) {
                 if (!GOOD()) {
                     bad("compressed data corrupted, check values mismatch",
                         entries, here, here_hi);
