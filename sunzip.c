@@ -1,6 +1,6 @@
 /* sunzip.c -- streaming unzip for reading a zip file from stdin
-  Copyright (C) 2006, 2014, 2016 Mark Adler
-  version 0.4  11 July 2016
+  Copyright (C) 2006, 2014, 2016, 2021 Mark Adler
+  version 0.5  6 Jan 2021
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the author be held liable for any damages
@@ -65,6 +65,8 @@
                      Allow bit 11 to be set in general purpose flags
    0.4  11 Jul 2016  Use blast for DCL imploded entries (method 10)
                      Add zlib license
+   0.5   6 Jan 2021  Add -r option to retain temporary files in the event of
+                     an error.
 
  */
 
@@ -1743,7 +1745,7 @@ int main(int argc, char **argv)
 
     /* give help if input not redirected */
     if (isatty(0)) {
-        puts("sunzip 0.4, streaming unzip by Mark Adler");
+        puts("sunzip 0.5, streaming unzip by Mark Adler");
         puts("usage: ... | sunzip [-t] [-o] [-r] [-p x] [-q[q]] [dir]");
         puts("       sunzip [-t] [-o] [-p x] [-r] [-q[q]] [dir] < infile.zip");
         puts("");
