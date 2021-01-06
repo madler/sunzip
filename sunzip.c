@@ -374,10 +374,14 @@ local void mvtempdir(char *newtemp)
 /* true if in the middle of a line on stdout */
 local int midline = 0;
 
+/* true to retain temporary files in the event of an error */
+local int retain = 0;
+
 /* abort with an error message */
 local int bye(char *why)
 {
-    rmtempdir();                /* don't leave a mess behind */
+    if (!retain)
+        rmtempdir();            /* don't leave a mess behind */
     putchar(midline ? '\n' : '\r');
     fflush(stdout);
     fprintf(stderr, "sunzip abort: %s\n", why);
@@ -1740,11 +1744,12 @@ int main(int argc, char **argv)
     /* give help if input not redirected */
     if (isatty(0)) {
         puts("sunzip 0.4, streaming unzip by Mark Adler");
-        puts("usage: ... | sunzip [-t] [-o] [-p x] [-q[q]] [dir]");
-        puts("       sunzip [-t] [-o] [-p x] [-q[q]] [dir] < infile.zip");
+        puts("usage: ... | sunzip [-t] [-o] [-r] [-p x] [-q[q]] [dir]");
+        puts("       sunzip [-t] [-o] [-p x] [-r] [-q[q]] [dir] < infile.zip");
         puts("");
         puts("\t-t: test -- don't write files");
         puts("\t-o: overwrite existing files");
+        puts("\t-r: retain temporary files in the event of an error");
         puts("\t-p x: replace parent reference .. with this character");
         puts("\t-q: quiet -- display summary info and errors only");
         puts("\t-qq: really quiet -- display errors only");
@@ -1773,6 +1778,9 @@ int main(int argc, char **argv)
                     break;
                 case 'q':           /* quiet */
                     quiet++;        /* qq is even more quiet */
+                    break;
+                case 'r':           /* retain temporary files */
+                    retain = 1;
                     break;
                 case 't':           /* test */
                     write = 0;
