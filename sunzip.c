@@ -90,6 +90,7 @@
                         /* fopen(), fread(), fclose() */
 #include <stdlib.h>     /* exit(), malloc(), calloc(), free() */
 #include <string.h>     /* memcpy(), strcpy(), strlen(), strcmp() */
+#include <stdarg.h>     /* va_list, va_start(), va_end() */
 #include <ctype.h>      /* tolower() */
 #include <limits.h>     /* LONG_MIN */
 #include <time.h>       /* mktime() */
@@ -105,11 +106,25 @@
 #include <dirent.h>     /* opendir(), readdir(), closedir() */
 #include "zlib.h"       /* crc32(), z_stream, inflateBackInit(), */
                         /*   inflateBack(), inflateBackEnd() */
-#ifndef JUST_DEFLATE
-#include "infback9.h"   /* inflateBack9Init(), inflate9Back(), */
+
+/* Support of other compression methods. */
+#ifdef DEFLATE64
+#  include "infback9.h" /* inflateBack9Init(), inflate9Back(), */
                         /*   inflateBack9End() */
-#include "blast.h"      /* blast() */
-#include "bzlib.h"      /* BZ2_bzDecompressInit(), BZ2_bzDecompress(), */
+void *sunalloc(void *opaque, unsigned items, unsigned size) {
+    (void)opaque;
+    return malloc(items * (size_t)size);
+}
+void sunfree(void *opaque, void *ptr) {
+    (void)opaque;
+    free(ptr);
+}
+#endif
+#ifdef PKDCL
+#  include "blast.h"    /* blast() */
+#endif
+#ifdef BZIP2
+#  include "bzlib.h"    /* BZ2_bzDecompressInit(), BZ2_bzDecompress(), */
                         /*   BZ2_bzDecompressEnd() */
 #endif
 
@@ -380,13 +395,18 @@ local int midline = 0;
 local int retain = 0;
 
 /* abort with an error message */
-local int bye(char *why)
+local int bye(char *why, ...)
 {
     if (!retain)
         rmtempdir();            /* don't leave a mess behind */
     putchar(midline ? '\n' : '\r');
     fflush(stdout);
-    fprintf(stderr, "sunzip abort: %s\n", why);
+    fputs("sunzip abort: ", stderr);
+    va_list parms;
+    va_start(parms, why);
+    vfprintf(stderr, why, parms);
+    va_end(parms);
+    putc('\n', stderr);
     exit(1);
     return 0;       /* to make compiler happy -- will never get here */
 }
@@ -465,7 +485,7 @@ local char *to36(unsigned long low, unsigned long high)
         if (next - num == 8)
             *next++ = '.';
         if (next - num == 12)
-            bye("zip file too big for FAT file system names");
+            bye("zip file name too big for FAT file system");
 #endif
 
         /* write a digit and divide again until nothing left */
@@ -991,7 +1011,7 @@ local char *utf8name(unsigned char *extra, unsigned xlen,
     return name;
 }
 
-#ifndef JUST_DEFLATE
+#ifdef BZIP2
 
 /* ----- BZip2 Decompression Operation ----- */
 
@@ -1112,6 +1132,28 @@ local void bad(char *why, unsigned long entry,
         fprintf(stderr, "%lx\n", here);
 }
 
+/* return true if the compression method is handled and streamable */
+local int streamable(unsigned method) {
+    return method == 8          // deflate
+#ifdef DEFLATE64
+        || method == 9          // deflate64
+#endif
+#ifdef BZIP2
+        || method == 12         // bzip2
+#endif
+    ;
+}
+
+/* return true if the compression method is handled */
+local int handled(unsigned method) {
+    return streamable(method)
+        || method == 0          // stored
+#ifdef PKDCL
+        || method == 10         // PKWare DCL
+#endif
+    ;
+}
+
 /* macro to see if made by Unix-like system */
 #define BYUNIX() (madeby == 3 || madeby == 5 || madeby == 16 || \
                   madeby == 19 || madeby == 30)
@@ -1180,9 +1222,11 @@ local void sunzip(int file, int quiet, int write, int over)
     struct in ins, *in = &ins;          /* input structure */
     struct out outs, *out = &outs;      /* output structure */
     z_stream strms, *strm = NULL;       /* inflate structure */
-#ifndef JUST_DEFLATE
-    unsigned char *back;                /* returned next pointer */
+#ifdef DEFLATE64
     z_stream strms9, *strm9 = NULL;     /* inflate9 structure */
+#endif
+#ifdef BZIP2
+    unsigned char *back;                /* returned next pointer */
 #endif
 
     /* initialize i/o -- note that output buffer must be 64K both for
@@ -1227,7 +1271,8 @@ local void sunzip(int file, int quiet, int write, int over)
         here -= left;
 
         /* get and interpret next header signature */
-        switch (get4(in)) {
+        unsigned long sig = get4(in);
+        switch (sig) {
 
         case 0x08074b50UL:      /* spanning marker -- partial archive */
             if (mode != MARK)
@@ -1257,10 +1302,10 @@ local void sunzip(int file, int quiet, int write, int over)
             if ((flag & 9) == 9)
                 bye("cannot skip encrypted entry with deferred lengths");
             if (flag & 0xf7f0U)
-                bye("unknown zip header flags set");
+                bye("unknown zip header flags set (%04x)", flag);
             method = get2(in);          /* compression method */
-            if ((flag & 8) && method != 8 && method != 9 && method != 12)
-                bye("cannot handle deferred lengths for pre-deflate methods");
+            if ((flag & 8) && streamable(method))
+                bye("cannot defer lengths for method %u", method);
             acc = mod = dos2time(get4(in));     /* file date/time */
             crc = get4(in);             /* uncompressed CRC check value */
             clen = get4(in);            /* compressed size */
@@ -1283,8 +1328,7 @@ local void sunzip(int file, int quiet, int write, int over)
                                   &clen, &clen_hi, &ulen, &ulen_hi);
 
             /* create temporary file (including for directories and links) */
-            if (write && (method == 0 || method == 8 || method == 9 ||
-                          method == 10 || method == 12)) {
+            if (write && handled(method)) {
                 strcpy(temp, to36(here, here_hi));
                 out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
                 if (out->file == -1)
@@ -1344,7 +1388,7 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
-#ifndef JUST_DEFLATE
+#ifdef DEFLATE64
             else if (method == 9) {     /* deflated with deflate64 */
                 if (strm9 == NULL) {    /* initialize first time */
                     strm9 = &strms9;
@@ -1367,6 +1411,8 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
+#endif
+#ifdef PKDCL
             else if (method == 10) {    /* PKWare DCL implode */
                 ret = blast(get, in, put, out, &left, &next);
                 if (ret != 0) {
@@ -1375,6 +1421,8 @@ local void sunzip(int file, int quiet, int write, int over)
                     bye("zip file corrupted -- cannot continue");
                 }
             }
+#endif
+#ifdef BZIP2
             else if (method == 12) {    /* bzip2 compression */
                 left = bunzip2(next, left, in, out, outbuf, &back);
                 if (back == NULL) {
@@ -1466,8 +1514,7 @@ local void sunzip(int file, int quiet, int write, int over)
             }
 
             /* verify entry and display information (won't do if skipped) */
-            if (method == 0 || method == 8 || method == 9 || method == 10 ||
-                method == 12) {
+            if (handled(method)) {
                 if (!GOOD()) {
                     bad("compressed data corrupted, check values mismatch",
                         entries, here, here_hi);
@@ -1694,7 +1741,7 @@ local void sunzip(int file, int quiet, int write, int over)
             break;
 
         default:
-            bye("zip file format error (unknown zip signature)");
+            bye("zip file format error (unknown zip signature %08x)", sig);
         }
     } until (mode == END);              /* until end record reached (or EOF) */
 
@@ -1705,7 +1752,7 @@ local void sunzip(int file, int quiet, int write, int over)
         setdirtimes(root);              /* set saved directory times */
         prune(&root);                   /* free the directory tree */
     }
-#ifndef JUST_DEFLATE
+#ifdef DEFLATE64
     if (strm9 != NULL)
         inflateBack9End(strm9);
 #endif
@@ -1788,7 +1835,7 @@ int main(int argc, char **argv)
                     write = 0;
                     break;
                 default:
-                    bye("unknown option");
+                    bye("unknown option %c", *arg);
                 }
                 arg++;
             }
