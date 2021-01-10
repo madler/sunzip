@@ -395,7 +395,7 @@ local int midline = 0;
 local int retain = 0;
 
 /* abort with an error message */
-local int bye(char *why, ...)
+local unsigned bye(char *why, ...)
 {
     if (!retain)
         rmtempdir();            /* don't leave a mess behind */
@@ -785,6 +785,7 @@ local int ftype(char *name)
         case S_IFLNK:  return 3;
         default:  return 4;
     }
+    return 0;       // silly gcc
 }
 
 /* ----- Time Operations ----- */
@@ -1297,7 +1298,7 @@ local void sunzip(int file, int quiet, int write, int over)
             }
 
             /* process local header */
-            get2(in);                   /* version needed to extract */
+            (void)get2(in);             /* version needed to extract */
             flag = get2(in);            /* general purpose flags */
             if ((flag & 9) == 9)
                 bye("cannot skip encrypted entry with deferred lengths");
@@ -1535,7 +1536,7 @@ local void sunzip(int file, int quiet, int write, int over)
             /* read central header */
             if (mode != CENTRAL)
                 bye("zip file format error (central file header misplaced)");
-            get1(in);                   /* version made by */
+            (void)get1(in);             /* version made by */
             madeby = get1(in);          /* OS made by */
             skip(14, in);               /* skip up through crc */
             clen = get4(in);            /* compressed length */
