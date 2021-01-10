@@ -1305,7 +1305,7 @@ local void sunzip(int file, int quiet, int write, int over)
             if (flag & 0xf7f0U)
                 bye("unknown zip header flags set (%04x)", flag);
             method = get2(in);          /* compression method */
-            if ((flag & 8) && streamable(method))
+            if ((flag & 8) && !streamable(method))
                 bye("cannot defer lengths for method %u", method);
             acc = mod = dos2time(get4(in));     /* file date/time */
             crc = get4(in);             /* uncompressed CRC check value */
