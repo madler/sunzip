@@ -71,16 +71,12 @@
  */
 
 /* Notes:
-   - Compile and link sunzip with zlib 1.2.3 or later, infback9.c and
-     inftree9.c (found in the zlib source distribution in contrib/infback9),
-     blast.c from zlib 1.2.9 or later (found in contrib/blast), and libbzip2.
+   - Compile and link sunzip with zlib 1.2.3 or later and libbzip2.
  */
 
 /* To-do:
    - Set EIGHTDOT3 for file systems that so restrict the file names
    - Tailor path name operations for different operating systems
-   - Set the long data descriptor signature once it's specified by PKWare
-     (looks like that will never happen)
    - Handle the entry name "-" differently?  (Created by piped zip.)
  */
 
