@@ -894,7 +894,9 @@ local void xtimes(unsigned char *extra, unsigned xlen, long *acc, long *mod) {
 local int zip64local(unsigned char *extra, unsigned xlen,
                      unsigned long *clen, unsigned long *clen_hi,
                      unsigned long *ulen, unsigned long *ulen_hi) {
-    /* process zip64 Extended Information block */
+    /* process Zip64 extended information extra field */
+    // From section 4.5.3 of the PKWare appnote, this field in a local header
+    // must include both the uncompressed and compressed lengths.
     unsigned char *block;
     unsigned len;
     if (getblock(0x0001, extra, xlen, &block, &len) && len >= 16) {
@@ -914,21 +916,17 @@ local int zip64local(unsigned char *extra, unsigned xlen,
 local void zip64central(unsigned char *extra, unsigned xlen,
                         unsigned long clen, unsigned long ulen,
                         unsigned long *offset, unsigned long *offset_hi) {
-    /* process zip64 Extended Information block */
+    /* process Zip64 extended information extra field */
     unsigned char *block;
-    unsigned len;
-    if (getblock(0x0001, extra, xlen, &block, &len) && len >= 16) {
-        if (ulen == LOW4) {
-            block += 8;
-            len -= 8;
-        }
-        if (clen == LOW4) {
-            block += 8;
-            len -= 8;
-        }
-        if (len >= 8) {
-            *offset = little4(block);
-            *offset_hi = little4(block + 4);
+    unsigned len, pos = 0;
+    if (getblock(0x0001, extra, xlen, &block, &len)) {
+        if (ulen == LOW4)
+            pos += 8;
+        if (clen == LOW4)
+            pos += 8;
+        if (*offset == LOW4 && *offset_hi == 0 && len >= pos + 8) {
+            *offset = little4(block + pos);
+            *offset_hi = little4(block + pos + 4);
         }
     }
 }
