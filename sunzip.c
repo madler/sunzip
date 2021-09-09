@@ -83,7 +83,7 @@
 /* ----- External Functions, Types, and Constants Definitions ----- */
 
 #include <stdio.h>      /* printf(), fprintf(), fflush(), rename(), puts(), */
-                        /* fopen(), fread(), fclose() */
+                        /* fopen(), fread(), fclose(), perror() */
 #include <stdlib.h>     /* exit(), malloc(), calloc(), free() */
 #include <string.h>     /* memcpy(), strcpy(), strlen(), strcmp() */
 #include <stdarg.h>     /* va_list, va_start(), va_end() */
@@ -92,9 +92,10 @@
 #include <time.h>       /* mktime() */
 #include <sys/time.h>   /* utimes() */
 #include <assert.h>     /* assert() */
-#include <signal.h>     /* signal() */
+#include <signal.h>     /* signal(), killpg() */
 #include <unistd.h>     /* read(), close(), isatty(), chdir(), mkdtemp() or */
-                        /* mktemp(), unlink(), rmdir(), symlink() */
+                        /* mktemp(), unlink(), rmdir(), symlink(), dup2(), */
+                        /* execvp(), fork(), pipe(), */
 #include <fcntl.h>      /* open(), write(), O_WRONLY, O_CREAT, O_EXCL */
 #include <sys/types.h>  /* for mkdir(), stat() */
 #include <sys/stat.h>   /* mkdir(), stat() */
@@ -102,6 +103,7 @@
 #include <dirent.h>     /* opendir(), readdir(), closedir() */
 #include "zlib.h"       /* crc32(), z_stream, inflateBackInit(), */
                         /*   inflateBack(), inflateBackEnd() */
+#include <sys/wait.h>   /* wait() */
 
 /* Support of other compression methods. */
 #ifdef DEFLATE64
@@ -368,10 +370,23 @@ local int midline = 0;
    bye()) */
 local int retain = 0;
 
-/* abort with an error message */
+/* cleanup, and abort with an error message. */
 local unsigned bye(char *why, ...) {
+    // TODO: 
+    // - maybe track child pids, so we can get rid of SIG_IGN kludge and send uncatchable signals
+    // - maybe use smarter kiling scheme. For example: https://gist.github.com/gizlu/ef2919ea1aa455f159694f8753e5cdec
+    //   I also though about playing it simple - close childs stdin, and assume that they exit
+    signal(SIGTERM, SIG_IGN); /* ignore SIGTERM to avoid suicide */
+    killpg(0, SIGTERM); /* kill all childs with SIGTERM */
+    while(wait(NULL) != -1); /* wait for childs termination */
+    // ECHILD *must* occur (it means that there are no more childs)
+    if(errno != ECHILD) {
+        perror("wait() failed"); 
+    }
+
     if (!retain)
         rmtempdir();            /* don't leave a mess behind */
+
     putchar(midline ? '\n' : '\r');
     fflush(stdout);
     fputs("sunzip abort: ", stderr);
@@ -1098,12 +1113,85 @@ local int handled(unsigned method) {
             ulen_hi == out->count_hi : 1))
 #endif
 
+struct cb_prog
+{
+    char* const* argv; // if == NULL then there is no callback prog
+    unsigned job_limit; // max concurent jobs. If argv != NULL, must be > 0, otherwise ignored
+    unsigned jobs; // current job cout. Init it to 0
+};
+/* if cb.argv != NULL, prog specified in it will be invoked for each extracted file,
+   with its content suplied to stdin. Prog's stdout is then saved instead of original
+   file. Unfortunately prog's exit code is curently ignored - sunzip will keep running
+   even if prog fail. This kinda suck, but it hugely simplifies integration with
+   programs that panic on unrecognized input. TODO: add option to enable exit code
+   checking or at least inform on which files error occured 
+*/
+
+#define READ_PIPE_END 0
+#define WRITE_PIPE_END 1
+
+/* spawn program and redirect it's stdout to specified file. Return pipe connected to its stdin */
+int spawn_callback(struct cb_prog* cb, char* writepath)
+{
+    // optimization ideas:
+    // - find best place for checking job_limit (and invoking wait())
+    // - adjust pipe or CHUNK size to make write() block less often
+    // - consider using vfork() or posix_spawn() instead of fork()
+
+    int pipefd[2]; /* pipe used for writing to childs stdin */
+    if(pipe(pipefd) == -1) {
+        bye("pipe creation failed: %s", strerror(errno));
+    }
+
+    pid_t pid = fork();
+    if(pid == -1) {
+        bye("fork failed: %s", strerror(errno));
+    }
+    else if(pid == 0) { // we are inside child
+        if(close(pipefd[WRITE_PIPE_END])) {
+            perror("sunzip's child: close error"); _exit(1);
+        }
+        if(dup2(pipefd[READ_PIPE_END], STDIN_FILENO) == -1) { // redirect read pipe end to stdin,
+            perror("sunzip's child: dup2 error"); _exit(1);
+        }
+        // I don't know whether this close is necessary:
+        if(close(pipefd[READ_PIPE_END])) { 
+            perror("sunzip's child: close error"); _exit(1);
+        }
+        int fd;
+        if((fd = open(writepath, O_WRONLY | O_CREAT | O_CLOEXEC, 0666)) == -1) {
+            perror("sunzip's child: open error"); _exit(1);
+        }
+        if(dup2(fd, STDOUT_FILENO) == -1) { // redirect stdout to file
+            perror("sunzip's child: dup2 error"); _exit(1);
+        } 
+        if(execvp(cb->argv[0], cb->argv)) { // replace child with prog
+            perror("sunzip's child: execvp error"); _exit(1);
+        }
+    }
+    else { // we are in parent
+        if((cb->jobs + 1) >= cb->job_limit) { // too much childs, wait for one
+            if(wait(NULL) == -1) bye("wait error: %s", strerror(errno)); 
+        } else {
+            ++cb->jobs;
+        }
+        if(close(pipefd[READ_PIPE_END])) {
+            bye("close error: %s", strerror(errno));
+        }
+        return pipefd[WRITE_PIPE_END];
+    }
+    return 0;  // to make compiler happy -- will never get here
+}
+
+
 /* process a streaming zip file, i.e. without seeking: read input from file,
    limit output if quiet is 1, more so if quiet is >= 2, write the decompressed
    data to files if write is true, otherwise just verify the entries, overwrite
    existing files if over is true, otherwise don't -- over must not be true if
-   write is false */
-local void sunzip(int file, int quiet, int write, int over) {
+   write is false. For details about cb see struct definition -- write
+   must be true if cb is used
+*/
+local void sunzip(int file, int quiet, int write, int over, struct cb_prog cb) {
     /* initialize i/o -- note that the output buffer must be 64K both for
        inflateBack9() as well as to load the maximum size name or extra
        fields */
@@ -1224,7 +1312,11 @@ local void sunzip(int file, int quiet, int write, int over) {
             struct out outs, *out = &outs;      /* output structure */
             if (write && handled(method)) {
                 strcpy(base, to36(here, here_hi));
-                out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
+                if(cb.argv != NULL) { /* there is callback */
+                    out->file = spawn_callback(&cb, tempdir);
+                } else {
+                    out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
+                }
                 if (out->file == -1)
                     bye("write error");
             }
@@ -1418,6 +1510,15 @@ local void sunzip(int file, int quiet, int write, int over) {
             break;
 
         case 0x02014b50UL:      /* central file header */
+
+            /* wait for all callback childs to finish (if any). We have to do it before
+             * processing central directory to avoid nasty race conditions. */
+            while(wait(NULL) != -1);
+            // ECHILD *must* occur (it means that there are no more childs)
+            if(errno != ECHILD) { 
+                bye("wait() failed: %s", strerror(errno));
+            }
+
             /* first time here: any earlier mode can arrive here */
             if (mode < CENTRAL) {
                 if (quiet < 2)
@@ -1668,7 +1769,7 @@ local void sunzip(int file, int quiet, int write, int over) {
 /* catch interrupt in order to delete temporary files and directory */
 local void cutshort(int n) {
     (void)n;
-    bye("user interrupt");
+    bye("user interrupt"); /* invoking that func in signal handler is inherently signal-unsafe btw. */
 }
 
 /* process arguments and then unzip from stdin */
@@ -1759,7 +1860,12 @@ int main(int argc, char **argv) {
                 bye("write error");
         }
 
+    /* char* cb_argv[] = {"cwebp", "-quiet", "-m", "1", "-o", "-", "--", "-",  NULL}; */
+    char* cb_argv[] = {"tac", NULL}; // useless callback, for easy testing
+    int job_limit = 8;
+    struct cb_prog cb = {cb_argv, job_limit, 0};
+
     /* unzip from stdin */
-    sunzip(0, quiet, write, over);
+    sunzip(0, quiet, write, over, cb);
     return 0;
 }
