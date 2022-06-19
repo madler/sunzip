@@ -1783,38 +1783,45 @@ int main(int argc, char **argv) {
     /* give help if input not redirected */
     if (isatty(0)) {
         puts("sunzip 0.5, streaming unzip by Mark Adler");
-        puts("usage: ... | sunzip [-t] [-o] [-r] [-p x] [-q[q]] [dir]");
-        puts("       sunzip [-t] [-o] [-p x] [-r] [-q[q]] [dir] < infile.zip");
+        puts("Usage:");
+        puts(" ... | sunzip [options] [dir]");
+        puts(" sunzip [options] [dir] < infile.zip");
         puts("");
-        puts("\t-t: test -- don't write files");
-        puts("\t-o: overwrite existing files");
-        puts("\t-r: retain temporary files in the event of an error");
-        puts("\t-p x: replace parent reference .. with this character");
-        puts("\t-q: quiet -- display summary info and errors only");
-        puts("\t-qq: really quiet -- display errors only");
-        puts("\tdir: subdirectory to create files in (if writing)");
+        puts("Options:");
+        puts(" -t: test -- don't write files");
+        puts(" -o: overwrite existing files");
+        puts(" -r: retain temporary files in the event of an error");
+        puts(" -p x: replace parent reference .. with this character");
+        puts(" -q: quiet -- display summary info and errors only");
+        puts(" -qq: really quiet -- display errors only");
+        puts(" -c cmd [cmd_arg ...] ;");
+        puts("   Pipe each extracted file to specified program and save its stdout on disk.");
+        puts("   All arguments beetween prog_name and semicolon are used as its args.");
+        puts("   Unfortunately prog's exit status is ignored - sunzip will keep running");
+        puts("   even if prog fail (Yeah, that sucks). Note: semicolon might need to be");
+        puts("   escaped with '\\' to protect it from being intercepted by shell");
+        puts(" -j n: limit concurent jobs spawned by -c. Default: 1");
+        puts(" dir: subdirectory to create files in (if writing)");
+        puts("");
+        puts("Examples:");
+        puts(" Extract local zip to specified dir: sunzip foo/bar/ < infile.zip");
+        puts(" Extract remote zip: curl http://foo.com/bar.zip | sunzip");
+        puts(" Extract remote zip and convert files to webp on the fly (four concurent cwebp):");
+        puts("  curl http://foo.com/bar.zip | sunzip -c cwebp -quiet -o - -- - \\; -j 4");
+
         return 0;
     }
 
+    struct cb_prog cb = {.argv = NULL, .job_limit = 1, .jobs = 0};
     /* scan options in arguments */
     int quiet = 0, write = 1, over = 0;     /* initial options */
-    int parm = 0;
     for (int n = 1; n < argc; n++)
-        if (parm) {
-            parrepl = argv[n][0];
-            if (parrepl == 0 || argv[n][1])
-                bye("need one character after -p");
-            parm = 0;
-        }
-        else if (argv[n][0] == '-') {
+        if (argv[n][0] == '-') { /* scan options */
             char *arg = argv[n] + 1;
             while (*arg) {
                 switch (*arg) {
                 case 'o':           /* overwrite existing files */
                     over = 1;
-                    break;
-                case 'p':           /* parent ".." replacement character */
-                    parm = 1;       /* get character in next arg */
                     break;
                 case 'q':           /* quiet */
                     quiet++;        /* qq is even more quiet */
@@ -1825,34 +1832,47 @@ int main(int argc, char **argv) {
                 case 't':           /* test */
                     write = 0;
                     break;
+                case 'p':           /* parent ".." replacement character */
+                    ++n;
+                    if(n < argc && strlen(argv[n]) == 1) {
+                        parrepl = argv[n][0];
+                    } else {
+                        bye("need one character after -p");
+                    }
+                    break;
+                case 'c': /* callback command - program used to preprocess each extracted file */
+                    ++n;
+                    unsigned begin = n;
+                    for(; n < argc; ++n)
+                    {
+                        if(strcmp(argv[n], ";") == 0) {
+                            cb.argv = &argv[begin];
+                            argv[n] = NULL;
+                            break;
+                        }
+                    }
+                    if(n == argc) { /* no semicolon found */
+                        bye("argument after -c need to be terminated with semicolon (see help)");
+                    }
+                    break;
+                case 'j': /* limit of concurrent callback instances */
+                    ++n;
+                    unsigned long tmp;
+                    if(n >= argc || (tmp = strtoul(argv[n], NULL, 10)) == 0 || tmp >= UINT_MAX) {
+                          bye("need positive integer after -j");
+                    }
+                    cb.job_limit = tmp;
+                    break;
                 default:
                     bye("unknown option %c", *arg);
                 }
                 arg++;
             }
         }
-
-    /* check option consistency */
-    if (parm)
-        bye("nothing after -p");
-    if (over && !write)
-        bye("can't combine -o with -t");
-    if (parrepl == '.')
-        fputs("sunzip warning: parent directory access allowed\n", stderr);
-
-    /* scan non-options, which is where to create and put entries in -- the
-       directory is created and then we cd in there, multiple name arguments
-       simply create deeper subdirectories for the destination */
-    for (int n = 1; n < argc; n++)
-        if (parm)
-            parm = 0;
-        else if (argv[n][0] == '-') {
-            char *arg = argv[n] + 1;
-            while (*arg)
-                if (*arg++ == 'p')
-                    parm = 1;
-        }
         else {
+            /* scan non-options, which is where to create and put entries in -- the
+               directory is created and then we cd in there, multiple name arguments
+               simply create deeper subdirectories for the destination */
             if (!write)
                 bye("cannot specify destination directory with -t");
             mkpath(argv[n]);
@@ -1860,10 +1880,13 @@ int main(int argc, char **argv) {
                 bye("write error");
         }
 
-    /* char* cb_argv[] = {"cwebp", "-quiet", "-m", "1", "-o", "-", "--", "-",  NULL}; */
-    char* cb_argv[] = {"tac", NULL}; // useless callback, for easy testing
-    int job_limit = 8;
-    struct cb_prog cb = {cb_argv, job_limit, 0};
+    /* check option consistency */
+    if (over && !write)
+        bye("can't combine -o with -t");
+    if (cb.job_limit != 1 && cb.argv == NULL)
+        bye("Unable to use -j without -c");
+    if (parrepl == '.')
+        fputs("sunzip warning: parent directory access allowed\n", stderr);
 
     /* unzip from stdin */
     sunzip(0, quiet, write, over, cb);
