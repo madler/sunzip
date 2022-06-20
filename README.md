@@ -3,9 +3,10 @@ Synopsis
 
 _sunzip_ is a streaming unzip utility. It will read a .zip file from stdin and
 decompress its contents into the current directory. Command line options allow
-specifying a different destination directory, overwriting existing files
-(normally prevented), and testing the contents of .zip file instead of writing
-the decompressed files.
+specifying a different destination directory; overwriting existing files
+(normally prevented); streaming each file to specified program and saving its
+stdout instead of original file; testing the contents of .zip file instead 
+of writing the decompressed files.
 
 _sunzip_ can decompress methods 0 (stored), 8 (deflated), 9 (Deflate64), 10
 (DCL imploded), and 12 (bzip2). _sunzip_ handles Zip64 .zip files. It does not

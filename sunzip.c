@@ -67,7 +67,12 @@
                      Add zlib license
    0.5   6 Jan 2021  Add -r option to retain temporary files in the event of
                      an error.
-
+   0.6  xxxxxxxxxxx  Add -c option that pipes each extracted file to specified program
+                     and save its stdout on disk.
+                     Add -j option for limiting count of concurent instances of program
+                     spawned by -c
+                     NOTE: this patch is currently unix specific (tested on linux and freebsd)
+                     Probably won't even compile on windows (I don't know if it did before)
  */
 
 /* Notes:
