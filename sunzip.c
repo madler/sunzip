@@ -1148,6 +1148,12 @@ int spawn_callback(struct cb_prog* cb, char* writepath)
         bye("pipe creation failed: %s", strerror(errno));
     }
 
+    if(cb->jobs == cb->job_limit) { // too much childs, wait for one
+        if(wait(NULL) == -1) bye("wait error: %s", strerror(errno)); 
+    } else {
+        ++cb->jobs;
+    }
+
     pid_t pid = fork();
     if(pid == -1) {
         bye("fork failed: %s", strerror(errno));
@@ -1175,11 +1181,6 @@ int spawn_callback(struct cb_prog* cb, char* writepath)
         }
     }
     else { // we are in parent
-        if((cb->jobs + 1) >= cb->job_limit) { // too much childs, wait for one
-            if(wait(NULL) == -1) bye("wait error: %s", strerror(errno)); 
-        } else {
-            ++cb->jobs;
-        }
         if(close(pipefd[READ_PIPE_END])) {
             bye("close error: %s", strerror(errno));
         }
