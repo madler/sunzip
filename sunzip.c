@@ -1136,7 +1136,7 @@ struct cb_prog
 #define WRITE_PIPE_END 1
 
 /* spawn program and redirect it's stdout to specified file. Return pipe connected to its stdin */
-int spawn_callback(struct cb_prog* cb, char* writepath)
+local int spawn_callback(struct cb_prog* cb, char* writepath)
 {
     // optimization ideas:
     // - find best place for checking job_limit (and invoking wait())
