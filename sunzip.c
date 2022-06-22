@@ -67,7 +67,12 @@
                      Add zlib license
    0.5   6 Jan 2021  Add -r option to retain temporary files in the event of
                      an error.
-
+   0.6  xxxxxxxxxxx  Add -c option that pipes each extracted file to specified program
+                     and save its stdout on disk.
+                     Add -j option for limiting count of concurent instances of program
+                     spawned by -c
+                     NOTE: this patch is currently unix specific (tested on linux and freebsd)
+                     Probably won't even compile on windows (I don't know if it did before)
  */
 
 /* Notes:
@@ -83,7 +88,7 @@
 /* ----- External Functions, Types, and Constants Definitions ----- */
 
 #include <stdio.h>      /* printf(), fprintf(), fflush(), rename(), puts(), */
-                        /* fopen(), fread(), fclose() */
+                        /* fopen(), fread(), fclose(), perror() */
 #include <stdlib.h>     /* exit(), malloc(), calloc(), free() */
 #include <string.h>     /* memcpy(), strcpy(), strlen(), strcmp() */
 #include <stdarg.h>     /* va_list, va_start(), va_end() */
@@ -92,9 +97,10 @@
 #include <time.h>       /* mktime() */
 #include <sys/time.h>   /* utimes() */
 #include <assert.h>     /* assert() */
-#include <signal.h>     /* signal() */
+#include <signal.h>     /* signal(), killpg() */
 #include <unistd.h>     /* read(), close(), isatty(), chdir(), mkdtemp() or */
-                        /* mktemp(), unlink(), rmdir(), symlink() */
+                        /* mktemp(), unlink(), rmdir(), symlink(), dup2(), */
+                        /* execvp(), fork(), pipe(), */
 #include <fcntl.h>      /* open(), write(), O_WRONLY, O_CREAT, O_EXCL */
 #include <sys/types.h>  /* for mkdir(), stat() */
 #include <sys/stat.h>   /* mkdir(), stat() */
@@ -102,6 +108,7 @@
 #include <dirent.h>     /* opendir(), readdir(), closedir() */
 #include "zlib.h"       /* crc32(), z_stream, inflateBackInit(), */
                         /*   inflateBack(), inflateBackEnd() */
+#include <sys/wait.h>   /* wait() */
 
 /* Support of other compression methods. */
 #ifdef DEFLATE64
@@ -368,10 +375,23 @@ local int midline = 0;
    bye()) */
 local int retain = 0;
 
-/* abort with an error message */
+/* cleanup, and abort with an error message. */
 local unsigned bye(char *why, ...) {
+    // TODO: 
+    // - maybe track child pids, so we can get rid of SIG_IGN kludge and send uncatchable signals
+    // - maybe use smarter kiling scheme. For example: https://gist.github.com/gizlu/ef2919ea1aa455f159694f8753e5cdec
+    //   I also though about playing it simple - close childs stdin, and assume that they exit
+    signal(SIGTERM, SIG_IGN); /* ignore SIGTERM to avoid suicide */
+    killpg(0, SIGTERM); /* kill all childs with SIGTERM */
+    while(wait(NULL) != -1); /* wait for childs termination */
+    // ECHILD *must* occur (it means that there are no more childs)
+    if(errno != ECHILD) {
+        perror("wait() failed"); 
+    }
+
     if (!retain)
         rmtempdir();            /* don't leave a mess behind */
+
     putchar(midline ? '\n' : '\r');
     fflush(stdout);
     fputs("sunzip abort: ", stderr);
@@ -1098,12 +1118,86 @@ local int handled(unsigned method) {
             ulen_hi == out->count_hi : 1))
 #endif
 
+struct cb_prog
+{
+    char* const* argv; // if == NULL then there is no callback prog
+    unsigned job_limit; // max concurent jobs. If argv != NULL, must be > 0, otherwise ignored
+    unsigned jobs; // current job cout. Init it to 0
+};
+/* if cb.argv != NULL, prog specified in it will be invoked for each extracted file,
+   with its content suplied to stdin. Prog's stdout is then saved instead of original
+   file. Unfortunately prog's exit code is curently ignored - sunzip will keep running
+   even if prog fail. This kinda suck, but it hugely simplifies integration with
+   programs that panic on unrecognized input. TODO: add option to enable exit code
+   checking or at least inform on which files error occured 
+*/
+
+#define READ_PIPE_END 0
+#define WRITE_PIPE_END 1
+
+/* spawn program and redirect it's stdout to specified file. Return pipe connected to its stdin */
+local int spawn_callback(struct cb_prog* cb, char* writepath)
+{
+    // optimization ideas:
+    // - find best place for checking job_limit (and invoking wait())
+    // - adjust pipe or CHUNK size to make write() block less often
+    // - consider using vfork() or posix_spawn() instead of fork()
+
+    int pipefd[2]; /* pipe used for writing to childs stdin */
+    if(pipe(pipefd) == -1) {
+        bye("pipe creation failed: %s", strerror(errno));
+    }
+
+    if(cb->jobs == cb->job_limit) { // too much childs, wait for one
+        if(wait(NULL) == -1) bye("wait error: %s", strerror(errno)); 
+    } else {
+        ++cb->jobs;
+    }
+
+    pid_t pid = fork();
+    if(pid == -1) {
+        bye("fork failed: %s", strerror(errno));
+    }
+    else if(pid == 0) { // we are inside child
+        if(close(pipefd[WRITE_PIPE_END])) {
+            perror("sunzip's child: close error"); _exit(1);
+        }
+        if(dup2(pipefd[READ_PIPE_END], STDIN_FILENO) == -1) { // redirect read pipe end to stdin,
+            perror("sunzip's child: dup2 error"); _exit(1);
+        }
+        // I don't know whether this close is necessary:
+        if(close(pipefd[READ_PIPE_END])) { 
+            perror("sunzip's child: close error"); _exit(1);
+        }
+        int fd;
+        if((fd = open(writepath, O_WRONLY | O_CREAT | O_CLOEXEC, 0666)) == -1) {
+            perror("sunzip's child: open error"); _exit(1);
+        }
+        if(dup2(fd, STDOUT_FILENO) == -1) { // redirect stdout to file
+            perror("sunzip's child: dup2 error"); _exit(1);
+        } 
+        if(execvp(cb->argv[0], cb->argv)) { // replace child with prog
+            perror("sunzip's child: execvp error"); _exit(1);
+        }
+    }
+    else { // we are in parent
+        if(close(pipefd[READ_PIPE_END])) {
+            bye("close error: %s", strerror(errno));
+        }
+        return pipefd[WRITE_PIPE_END];
+    }
+    return 0;  // to make compiler happy -- will never get here
+}
+
+
 /* process a streaming zip file, i.e. without seeking: read input from file,
    limit output if quiet is 1, more so if quiet is >= 2, write the decompressed
    data to files if write is true, otherwise just verify the entries, overwrite
    existing files if over is true, otherwise don't -- over must not be true if
-   write is false */
-local void sunzip(int file, int quiet, int write, int over) {
+   write is false. For details about cb see struct definition -- write
+   must be true if cb is used
+*/
+local void sunzip(int file, int quiet, int write, int over, struct cb_prog cb) {
     /* initialize i/o -- note that the output buffer must be 64K both for
        inflateBack9() as well as to load the maximum size name or extra
        fields */
@@ -1224,7 +1318,11 @@ local void sunzip(int file, int quiet, int write, int over) {
             struct out outs, *out = &outs;      /* output structure */
             if (write && handled(method)) {
                 strcpy(base, to36(here, here_hi));
-                out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
+                if(cb.argv != NULL) { /* there is callback */
+                    out->file = spawn_callback(&cb, tempdir);
+                } else {
+                    out->file = open(tempdir, O_WRONLY | O_CREAT, 0666);
+                }
                 if (out->file == -1)
                     bye("write error");
             }
@@ -1418,6 +1516,15 @@ local void sunzip(int file, int quiet, int write, int over) {
             break;
 
         case 0x02014b50UL:      /* central file header */
+
+            /* wait for all callback childs to finish (if any). We have to do it before
+             * processing central directory to avoid nasty race conditions. */
+            while(wait(NULL) != -1);
+            // ECHILD *must* occur (it means that there are no more childs)
+            if(errno != ECHILD) { 
+                bye("wait() failed: %s", strerror(errno));
+            }
+
             /* first time here: any earlier mode can arrive here */
             if (mode < CENTRAL) {
                 if (quiet < 2)
@@ -1668,7 +1775,7 @@ local void sunzip(int file, int quiet, int write, int over) {
 /* catch interrupt in order to delete temporary files and directory */
 local void cutshort(int n) {
     (void)n;
-    bye("user interrupt");
+    bye("user interrupt"); /* invoking that func in signal handler is inherently signal-unsafe btw. */
 }
 
 /* process arguments and then unzip from stdin */
@@ -1682,38 +1789,45 @@ int main(int argc, char **argv) {
     /* give help if input not redirected */
     if (isatty(0)) {
         puts("sunzip 0.5, streaming unzip by Mark Adler");
-        puts("usage: ... | sunzip [-t] [-o] [-r] [-p x] [-q[q]] [dir]");
-        puts("       sunzip [-t] [-o] [-p x] [-r] [-q[q]] [dir] < infile.zip");
+        puts("Usage:");
+        puts(" ... | sunzip [options] [dir]");
+        puts(" sunzip [options] [dir] < infile.zip");
         puts("");
-        puts("\t-t: test -- don't write files");
-        puts("\t-o: overwrite existing files");
-        puts("\t-r: retain temporary files in the event of an error");
-        puts("\t-p x: replace parent reference .. with this character");
-        puts("\t-q: quiet -- display summary info and errors only");
-        puts("\t-qq: really quiet -- display errors only");
-        puts("\tdir: subdirectory to create files in (if writing)");
+        puts("Options:");
+        puts(" -t: test -- don't write files");
+        puts(" -o: overwrite existing files");
+        puts(" -r: retain temporary files in the event of an error");
+        puts(" -p x: replace parent reference .. with this character");
+        puts(" -q: quiet -- display summary info and errors only");
+        puts(" -qq: really quiet -- display errors only");
+        puts(" -c cmd [cmd_arg ...] ;");
+        puts("   Pipe each extracted file to specified program and save its stdout on disk.");
+        puts("   All arguments beetween prog_name and semicolon are used as its args.");
+        puts("   Unfortunately prog's exit status is ignored - sunzip will keep running");
+        puts("   even if prog fail (Yeah, that sucks). Note: semicolon might need to be");
+        puts("   escaped with '\\' to protect it from being intercepted by shell");
+        puts(" -j n: limit concurent jobs spawned by -c. Default: 1");
+        puts(" dir: subdirectory to create files in (if writing)");
+        puts("");
+        puts("Examples:");
+        puts(" Extract local zip to specified dir: sunzip foo/bar/ < infile.zip");
+        puts(" Extract remote zip: curl http://foo.com/bar.zip | sunzip");
+        puts(" Extract remote zip and convert files to webp on the fly (four concurent cwebp):");
+        puts("  curl http://foo.com/bar.zip | sunzip -c cwebp -quiet -o - -- - \\; -j 4");
+
         return 0;
     }
 
+    struct cb_prog cb = {.argv = NULL, .job_limit = 1, .jobs = 0};
     /* scan options in arguments */
     int quiet = 0, write = 1, over = 0;     /* initial options */
-    int parm = 0;
     for (int n = 1; n < argc; n++)
-        if (parm) {
-            parrepl = argv[n][0];
-            if (parrepl == 0 || argv[n][1])
-                bye("need one character after -p");
-            parm = 0;
-        }
-        else if (argv[n][0] == '-') {
+        if (argv[n][0] == '-') { /* scan options */
             char *arg = argv[n] + 1;
             while (*arg) {
                 switch (*arg) {
                 case 'o':           /* overwrite existing files */
                     over = 1;
-                    break;
-                case 'p':           /* parent ".." replacement character */
-                    parm = 1;       /* get character in next arg */
                     break;
                 case 'q':           /* quiet */
                     quiet++;        /* qq is even more quiet */
@@ -1724,34 +1838,47 @@ int main(int argc, char **argv) {
                 case 't':           /* test */
                     write = 0;
                     break;
+                case 'p':           /* parent ".." replacement character */
+                    ++n;
+                    if(n < argc && strlen(argv[n]) == 1) {
+                        parrepl = argv[n][0];
+                    } else {
+                        bye("need one character after -p");
+                    }
+                    break;
+                case 'c': /* callback command - program used to preprocess each extracted file */
+                    ++n;
+                    unsigned begin = n;
+                    for(; n < argc; ++n)
+                    {
+                        if(strcmp(argv[n], ";") == 0) {
+                            cb.argv = &argv[begin];
+                            argv[n] = NULL;
+                            break;
+                        }
+                    }
+                    if(n == argc) { /* no semicolon found */
+                        bye("argument after -c need to be terminated with semicolon (see help)");
+                    }
+                    break;
+                case 'j': /* limit of concurrent callback instances */
+                    ++n;
+                    unsigned long tmp;
+                    if(n >= argc || (tmp = strtoul(argv[n], NULL, 10)) == 0 || tmp >= UINT_MAX) {
+                          bye("need positive integer after -j");
+                    }
+                    cb.job_limit = tmp;
+                    break;
                 default:
                     bye("unknown option %c", *arg);
                 }
                 arg++;
             }
         }
-
-    /* check option consistency */
-    if (parm)
-        bye("nothing after -p");
-    if (over && !write)
-        bye("can't combine -o with -t");
-    if (parrepl == '.')
-        fputs("sunzip warning: parent directory access allowed\n", stderr);
-
-    /* scan non-options, which is where to create and put entries in -- the
-       directory is created and then we cd in there, multiple name arguments
-       simply create deeper subdirectories for the destination */
-    for (int n = 1; n < argc; n++)
-        if (parm)
-            parm = 0;
-        else if (argv[n][0] == '-') {
-            char *arg = argv[n] + 1;
-            while (*arg)
-                if (*arg++ == 'p')
-                    parm = 1;
-        }
         else {
+            /* scan non-options, which is where to create and put entries in -- the
+               directory is created and then we cd in there, multiple name arguments
+               simply create deeper subdirectories for the destination */
             if (!write)
                 bye("cannot specify destination directory with -t");
             mkpath(argv[n]);
@@ -1759,7 +1886,15 @@ int main(int argc, char **argv) {
                 bye("write error");
         }
 
+    /* check option consistency */
+    if (over && !write)
+        bye("can't combine -o with -t");
+    if (cb.job_limit != 1 && cb.argv == NULL)
+        bye("Unable to use -j without -c");
+    if (parrepl == '.')
+        fputs("sunzip warning: parent directory access allowed\n", stderr);
+
     /* unzip from stdin */
-    sunzip(0, quiet, write, over);
+    sunzip(0, quiet, write, over, cb);
     return 0;
 }
