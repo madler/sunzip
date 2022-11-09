@@ -1088,13 +1088,13 @@ local int handled(unsigned method) {
 /* macro to check actual crc and lengths against expected */
 #ifdef BIGLONG
 #  define GOOD() (out->crc == crc && \
-    clen == (in->count & LOW4) && ulen == (out->count & LOW4) && \
-    (high ? clen_hi == (in->count >> 32) && \
+    clen == (in_count_saved & LOW4) && ulen == (out->count & LOW4) && \
+    (high ? clen_hi == (in_count_saved >> 32) && \
             ulen_hi == (out->count >> 32) : 1))
 #else
 #  define GOOD() (out->crc == crc && \
-    clen == in->count && ulen == out->count && \
-    (high ? clen_hi == in->count_hi && \
+    clen == in_count_saved && ulen == out->count && \
+    (high ? clen_hi == in_count_hi_saved && \
             ulen_hi == out->count_hi : 1))
 #endif
 
@@ -1345,6 +1345,12 @@ local void sunzip(int file, int quiet, int write, int over) {
             if (in->count < in->left)
                 in->count_hi--;
             in->count -= in->left;
+
+            // The get*() calls below may change the values of in->count
+            // and in->count_hi, yet we want the GOOD() macro to see the
+            // original values, so we save them.
+            const unsigned long in_count_saved = in->count;
+            const unsigned long in_count_hi_saved = in->count_hi;
 
             /* close file, set file times */
             if (out->file != -1) {
